@@ -34,6 +34,9 @@ def _scaling_stage(weights: Sequence[float], ml_info: dict, cfg: BacktestConfig)
     This keeps deterministic behavior while demonstrating the interface.
     """
     scalar = ml_info.get("scalar", [1.0] * len(weights))
+    # validate lengths to avoid silently dropping assets
+    if len(scalar) != len(weights):
+        raise ValueError(f"Scalar length {len(scalar)} does not match weights length {len(weights)}")
     scaled = [w * s for w, s in zip(weights, scalar)]
     # ensure no negative and normalize to sum 1 unless all zeros
     total = sum(abs(x) for x in scaled)
@@ -55,8 +58,17 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
 
     # sanitize run_id to avoid path traversal
     import re as _re
+    # basic token check
     if not _re.match(r'^[A-Za-z0-9._-]+$', run_id):
         raise ValueError("Invalid run_id; only A-Za-z0-9._- allowed")
+    # reject single or double-dot ids which can escape directories
+    if run_id in ('.', '..'):
+        raise ValueError("Invalid run_id; '.' and '..' are not allowed")
+    # ensure resolved path remains under out_root to prevent path traversal
+    out_root_abs = os.path.abspath(out_root)
+    candidate = os.path.abspath(os.path.join(out_root_abs, run_id))
+    if not (candidate == out_root_abs or candidate.startswith(out_root_abs + os.sep)):
+        raise ValueError("Invalid run_id; resolved path escapes out_root")
 
     out_dir = os.path.join(out_root, run_id)
     os.makedirs(out_dir, exist_ok=True)

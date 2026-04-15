@@ -26,7 +26,17 @@ def should_rebalance(current_w: float, candidate_w: float, expected_alpha: float
         return True
 
     # approximate annualized turnover by scaling delta by periods per year
-    periods = 252.0 if (cfg.freq or "D").upper().startswith("D") else 252.0
+    freq = (cfg.freq or "D").upper()
+    if freq.startswith("D"):
+        periods = 252.0
+    elif freq.startswith("W"):
+        periods = 52.0
+    elif freq.startswith("M"):
+        periods = 12.0
+    elif freq.startswith("H"):
+        periods = 252.0 * 24.0
+    else:
+        periods = 252.0
     annualized_turnover = delta * periods
     cost_rate = cfg.total_cost_rate()
     annual_costs = annualized_turnover * cost_rate
