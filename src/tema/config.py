@@ -8,6 +8,7 @@ class BacktestConfig:
     modular_data_signals_enabled: bool = False
     data_path: Optional[str] = None
     data_max_assets: int = 3
+    data_full_universe_for_parity: bool = True
     data_min_rows: int = 30
     data_train_ratio: float = 0.7
     signal_fast_period: int = 5

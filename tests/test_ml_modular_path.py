@@ -1,9 +1,11 @@
 import json
 from pathlib import Path
+import numpy as np
 
 from tema.config import BacktestConfig
 from tema.ml import compute_position_scalars, threshold_probabilities
 from tema.pipeline import run_pipeline
+from tema.pipeline import runner as pipeline_runner
 
 
 def _write_csv(path: Path, text: str) -> None:
@@ -62,3 +64,56 @@ def test_pipeline_ml_modular_path_integration(tmp_path):
     assert ml_info["modular_path_enabled"] is True
     assert len(ml_info["scalar"]) == 2
     assert all(s >= 0.0 for s in ml_info["scalar"])
+
+
+def test_scaling_stage_ml_decisions_change_weights():
+    cfg = BacktestConfig(vol_target_enabled=False)
+    out = pipeline_runner._scaling_stage(
+        weights=[0.25, 0.75],
+        ml_info={"scalar": [1.2, 0.8], "decisions": [1.0, 0.0]},
+        cfg=cfg,
+    )
+    assert len(out) == 2
+    assert out[0] == 1.0
+    assert out[1] == 0.0
+
+
+def test_scaling_stage_uses_realized_vol_proxy():
+    cfg = BacktestConfig(
+        vol_target_enabled=True,
+        vol_target_apply_to_ml=True,
+        vol_target_annual=0.10,
+        vol_target_min_leverage=0.25,
+        vol_target_max_leverage=12.0,
+    )
+    low_vol_train = np.array(
+        [
+            [0.0010, 0.0012],
+            [0.0011, 0.0010],
+            [0.0009, 0.0011],
+            [0.0010, 0.0009],
+        ],
+        dtype=float,
+    )
+    high_vol_train = np.array(
+        [
+            [0.03, -0.02],
+            [-0.02, 0.03],
+            [0.025, -0.03],
+            [-0.03, 0.02],
+        ],
+        dtype=float,
+    )
+    low_out = pipeline_runner._scaling_stage(
+        weights=[0.5, 0.5],
+        ml_info={"scalar": [1.0, 1.0], "decisions": [1.0, 1.0]},
+        cfg=cfg,
+        train_returns_window=low_vol_train,
+    )
+    high_out = pipeline_runner._scaling_stage(
+        weights=[0.5, 0.5],
+        ml_info={"scalar": [1.0, 1.0], "decisions": [1.0, 1.0]},
+        cfg=cfg,
+        train_returns_window=high_vol_train,
+    )
+    assert sum(abs(x) for x in low_out) > sum(abs(x) for x in high_out)

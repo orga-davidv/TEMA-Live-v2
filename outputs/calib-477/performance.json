@@ -1,0 +1,17 @@
+{
+  "sharpe": 224.0001391981751,
+  "annual_return": 27.564501565671808,
+  "annual_vol": 0.015065488703045736,
+  "max_drawdown": 0.0,
+  "annualized_turnover": 0.0,
+  "turnover_proxy": 0.0,
+  "periods": 30,
+  "equity_final": 1.4904338190381368,
+  "fallback_used": true,
+  "fallback_reason": "asset_returns and target_weights must have identical shapes",
+  "source": {
+    "mode": "synthetic_fallback",
+    "rows": 30,
+    "assets": 3
+  }
+}

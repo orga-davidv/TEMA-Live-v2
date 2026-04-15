@@ -20,6 +20,93 @@ from datetime import datetime
 import numpy as np
 
 
+def _annualization_factor(freq: str) -> float:
+    mapping = {
+        "D": 252.0,
+        "H": 252.0 * 24.0,
+        "W": 52.0,
+        "M": 12.0,
+    }
+    return float(mapping.get(str(freq).upper(), 252.0))
+
+
+def _effective_data_max_assets(cfg: BacktestConfig) -> tuple[Optional[int], bool]:
+    max_assets = cfg.data_max_assets
+    if (
+        cfg.modular_data_signals_enabled
+        and cfg.data_full_universe_for_parity
+        and int(max_assets) == 3
+    ):
+        return None, True
+    return int(max_assets), False
+
+
+def _load_data_context(cfg: BacktestConfig) -> dict:
+    max_assets, full_universe_override = _effective_data_max_assets(cfg)
+    price_df = load_price_panel(
+        data_path=cfg.data_path,
+        root=os.getcwd(),
+        max_assets=max_assets,
+        min_rows=max(3, cfg.data_min_rows),
+    )
+    train_df, test_df = split_train_test(price_df, train_ratio=cfg.data_train_ratio)
+    if train_df.empty or test_df.empty:
+        raise ValueError("train/test split produced empty partition")
+    train_returns = (
+        train_df.pct_change(fill_method=None)
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(how="all")
+        .fillna(0.0)
+    )
+    return {
+        "price_df": price_df,
+        "train_df": train_df,
+        "test_df": test_df,
+        "train_returns": train_returns,
+        "max_assets_used": max_assets,
+        "full_universe_override": full_universe_override,
+    }
+
+
+def _vol_proxy_from_train_window(train_returns_window: Optional[np.ndarray], weights: Sequence[float], freq: str) -> float:
+    if train_returns_window is None:
+        return 0.10
+    returns = np.asarray(train_returns_window, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    if returns.ndim != 2 or returns.shape[0] == 0 or returns.shape[1] != len(w):
+        return 0.10
+    pnl = returns @ w
+    if pnl.size == 0:
+        return 0.10
+    std = float(np.std(pnl, ddof=0))
+    if std <= 1e-12:
+        return 0.10
+    return std * float(np.sqrt(_annualization_factor(freq)))
+
+
+def _blend_signal_schedule_with_base_weights(signal_schedule: np.ndarray, base_weights: Sequence[float]) -> np.ndarray:
+    if signal_schedule.size == 0:
+        return signal_schedule
+    base = np.asarray(base_weights, dtype=float).reshape(-1)
+    if signal_schedule.ndim != 2 or signal_schedule.shape[1] != len(base):
+        raise ValueError("signal schedule columns must match base weights length")
+    base_abs = np.abs(base)
+    base_abs_sum = float(np.sum(base_abs))
+    if base_abs_sum <= 1e-12:
+        return signal_schedule
+    gross_target = base_abs_sum
+    out = np.zeros_like(signal_schedule, dtype=float)
+    for i in range(signal_schedule.shape[0]):
+        row = np.nan_to_num(signal_schedule[i], nan=0.0, posinf=0.0, neginf=0.0)
+        blended = row * base_abs
+        row_sum = float(np.sum(np.abs(blended)))
+        if row_sum <= 1e-12:
+            out[i] = base
+        else:
+            out[i] = (blended / row_sum) * gross_target
+    return out
+
+
 def _constant_weight_schedule(weights: Sequence[float], periods: int) -> np.ndarray:
     if periods <= 0:
         return np.empty((0, len(weights)), dtype=float)
@@ -40,35 +127,40 @@ def _synthetic_returns_from_alphas(expected_alphas: Sequence[float], periods: in
     return out
 
 
-def _backtest_stage(cfg: BacktestConfig, final_weights: Sequence[float], effective_alphas: Sequence[float]) -> dict:
+def _backtest_stage(
+    cfg: BacktestConfig,
+    final_weights: Sequence[float],
+    effective_alphas: Sequence[float],
+    data_context: Optional[dict] = None,
+) -> dict:
     """Compute deterministic performance metrics with data-first, safe-fallback behavior."""
     try:
-        price_df = load_price_panel(
-            data_path=cfg.data_path,
-            root=os.getcwd(),
-            max_assets=cfg.data_max_assets,
-            min_rows=max(3, cfg.data_min_rows),
-        )
+        ctx = data_context if data_context is not None else _load_data_context(cfg)
+        price_df = ctx["price_df"]
+        train_df = ctx["train_df"]
+        test_df = ctx["test_df"]
         returns_df = (
-            price_df.pct_change(fill_method=None)
+            test_df.pct_change(fill_method=None)
             .replace([np.inf, -np.inf], np.nan)
             .dropna(how="all")
             .fillna(0.0)
         )
         if returns_df.empty:
-            raise ValueError("returns panel is empty")
+            raise ValueError("test returns panel is empty")
 
         weights_path = _constant_weight_schedule(final_weights, len(returns_df))
         if cfg.modular_data_signals_enabled:
             engine = resolve_signal_engine(use_cpp=cfg.signal_use_cpp, cpp_engine=None)
+            history_df = price_df.loc[: test_df.index[-1]]
             signal_df = engine.generate(
-                price_df=price_df,
+                price_df=history_df,
                 fast_period=cfg.signal_fast_period,
                 slow_period=cfg.signal_slow_period,
                 method=cfg.signal_method,
             )
             signal_df = signal_df.reindex(returns_df.index).fillna(0.0)
-            weights_path = build_weight_schedule_from_signals(signal_df, fallback_weights=final_weights)
+            signal_weights = build_weight_schedule_from_signals(signal_df, fallback_weights=final_weights)
+            weights_path = _blend_signal_schedule_with_base_weights(signal_weights, base_weights=final_weights)
             if len(weights_path) != len(returns_df):
                 raise ValueError("signal-derived weights shape mismatch")
 
@@ -84,8 +176,10 @@ def _backtest_stage(cfg: BacktestConfig, final_weights: Sequence[float], effecti
             "equity_final": float(sim.equity_curve[-1]) if sim.equity_curve else 1.0,
             "fallback_used": False,
             "source": {
-                "mode": "historical_data",
+                "mode": "historical_test_data",
                 "rows": int(len(returns_df)),
+                "train_rows": int(len(train_df)),
+                "test_rows": int(len(test_df)),
                 "assets": list(returns_df.columns),
             },
         }
@@ -113,20 +207,21 @@ def _backtest_stage(cfg: BacktestConfig, final_weights: Sequence[float], effecti
         }
 
 
-def _portfolio_stage(cfg: BacktestConfig) -> tuple[Sequence[float], Sequence[float], Sequence[float], dict]:
+def _portfolio_stage(
+    cfg: BacktestConfig,
+    data_context: Optional[dict] = None,
+) -> tuple[Sequence[float], Sequence[float], Sequence[float], dict, Optional[np.ndarray]]:
     """Simplified BL/portfolio stage producing current, candidate, and expected alphas.
     In real code this would call into portfolio/optimization modules. Here we keep
     deterministic, small arrays so orchestration can be tested.
     """
     if cfg.modular_data_signals_enabled:
         try:
-            price_df = load_price_panel(
-                data_path=cfg.data_path,
-                root=os.getcwd(),
-                max_assets=cfg.data_max_assets,
-                min_rows=cfg.data_min_rows,
-            )
-            train_df, _ = split_train_test(price_df, train_ratio=cfg.data_train_ratio)
+            ctx = data_context if data_context is not None else _load_data_context(cfg)
+            price_df = ctx["price_df"]
+            train_df = ctx["train_df"]
+            test_df = ctx["test_df"]
+            train_returns = ctx["train_returns"]
             engine = resolve_signal_engine(use_cpp=cfg.signal_use_cpp, cpp_engine=None)
             signal_df = engine.generate(
                 price_df=train_df,
@@ -150,7 +245,7 @@ def _portfolio_stage(cfg: BacktestConfig) -> tuple[Sequence[float], Sequence[flo
             if cfg.portfolio_modular_enabled:
                 alloc = allocate_portfolio_weights(
                     expected_alphas=expected_alphas,
-                    returns_window=train_df.pct_change(fill_method=None).dropna().to_numpy(dtype=float),
+                    returns_window=train_returns.to_numpy(dtype=float),
                     signals=latest_signal.to_numpy(dtype=float),
                     method=method,
                     risk_aversion=cfg.portfolio_risk_aversion,
@@ -181,11 +276,15 @@ def _portfolio_stage(cfg: BacktestConfig) -> tuple[Sequence[float], Sequence[flo
                 "data_path": str(cfg.data_path) if cfg.data_path else None,
                 "assets": list(price_df.columns),
                 "n_rows": int(len(price_df)),
+                "train_rows": int(len(train_df)),
+                "test_rows": int(len(test_df)),
+                "data_max_assets_used": ctx["max_assets_used"],
+                "full_universe_override": bool(ctx["full_universe_override"]),
                 "portfolio_modular_enabled": bool(cfg.portfolio_modular_enabled),
                 "portfolio_method": portfolio_method,
                 "portfolio_allocation_fallback_used": portfolio_alloc_fallback,
                 "portfolio_diagnostics": portfolio_alloc_diag,
-            }
+            }, train_returns.to_numpy(dtype=float)
         except Exception as exc:
             current = [0.30, 0.40, 0.30]
             candidate = [0.25, 0.45, 0.30]
@@ -194,12 +293,12 @@ def _portfolio_stage(cfg: BacktestConfig) -> tuple[Sequence[float], Sequence[flo
                 "enabled": True,
                 "fallback_used": True,
                 "fallback_reason": str(exc),
-            }
+            }, None
 
     current = [0.30, 0.40, 0.30]
     candidate = [0.25, 0.45, 0.30]
     expected_alphas = [0.01, 0.02, 0.005]
-    return current, candidate, expected_alphas, {"enabled": False, "fallback_used": False}
+    return current, candidate, expected_alphas, {"enabled": False, "fallback_used": False}, None
 
 
 def _ml_filter_and_scalar(cfg: BacktestConfig, expected_alphas: Sequence[float]) -> dict:
@@ -248,7 +347,12 @@ def _ml_filter_and_scalar(cfg: BacktestConfig, expected_alphas: Sequence[float])
     }
 
 
-def _scaling_stage(weights: Sequence[float], ml_info: dict, cfg: BacktestConfig) -> List[float]:
+def _scaling_stage(
+    weights: Sequence[float],
+    ml_info: dict,
+    cfg: BacktestConfig,
+    train_returns_window: Optional[np.ndarray] = None,
+) -> List[float]:
     """Apply ml scalar and a naive vol-target style normalization.
     This keeps deterministic behavior while demonstrating the interface.
     """
@@ -257,17 +361,26 @@ def _scaling_stage(weights: Sequence[float], ml_info: dict, cfg: BacktestConfig)
     if len(scalar) != len(weights):
         raise ValueError(f"Scalar length {len(scalar)} does not match weights length {len(weights)}")
     scaled = [w * s for w, s in zip(weights, scalar)]
-    if cfg.vol_target_enabled:
-        target = max(float(cfg.vol_target_annual), 1e-6)
-        # deterministic proxy: stronger gross exposure when target vol is higher
-        leverage = max(cfg.vol_target_min_leverage, min(cfg.vol_target_max_leverage, target / 0.10))
-        if cfg.vol_target_apply_to_ml:
-            scaled = [x * leverage for x in scaled]
-    # ensure no negative and normalize to sum 1 unless all zeros
+    decisions = ml_info.get("decisions")
+    if isinstance(decisions, list) and len(decisions) == len(weights):
+        scaled = [x * max(0.0, float(d)) for x, d in zip(scaled, decisions)]
+    # normalize unless all zeros
     total = sum(abs(x) for x in scaled)
     if total == 0:
-        return list(scaled)
+        baseline = list(weights)
+        base_total = sum(abs(x) for x in baseline)
+        if base_total <= 0.0:
+            return list(scaled)
+        return [x / base_total for x in baseline]
     normalized = [x / total for x in scaled]
+    if cfg.vol_target_enabled and cfg.vol_target_apply_to_ml:
+        target = max(float(cfg.vol_target_annual), 1e-6)
+        realized_vol = _vol_proxy_from_train_window(train_returns_window, normalized, cfg.freq)
+        leverage = max(
+            cfg.vol_target_min_leverage,
+            min(cfg.vol_target_max_leverage, target / max(realized_vol, 1e-6)),
+        )
+        normalized = [x * leverage for x in normalized]
     return normalized
 
 
@@ -371,8 +484,15 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
     out_dir = os.path.join(out_root, run_id)
     os.makedirs(out_dir, exist_ok=True)
 
+    data_context = None
+    if cfg.modular_data_signals_enabled:
+        try:
+            data_context = _load_data_context(cfg)
+        except Exception:
+            data_context = None
+
     # Stage 1: Portfolio (BL-like)
-    current, candidate, expected_alphas, portfolio_info = _portfolio_stage(cfg)
+    current, candidate, expected_alphas, portfolio_info, train_returns_window = _portfolio_stage(cfg, data_context=data_context)
 
     # Stage 2: ML filter / scaler
     ml_info = _ml_filter_and_scalar(cfg, expected_alphas)
@@ -380,14 +500,19 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
     # Stage 3: Optional dynamic ensemble (feature-flagged)
     ensemble_alphas, ensemble_info = _ensemble_stage(cfg, current, candidate, expected_alphas, ml_info)
 
+    ml_scalar = ml_info.get("scalar", [1.0 for _ in ensemble_alphas])
+    if len(ml_scalar) != len(ensemble_alphas):
+        raise ValueError("ML scalar length mismatch in pipeline stage")
+    ml_effective_alphas = [a * s for a, s in zip(ensemble_alphas, ml_scalar)]
+
     # Stage 4: Turnover / cost gate
-    gated = apply_rebalance_gating(current, candidate, ensemble_alphas, cfg)
+    gated = apply_rebalance_gating(current, candidate, ml_effective_alphas, cfg)
 
     # Stage 5: Scaling stage
-    final_weights = _scaling_stage(gated, ml_info, cfg)
+    final_weights = _scaling_stage(gated, ml_info, cfg, train_returns_window=train_returns_window)
 
     # Stage 6: Backtest performance
-    performance = _backtest_stage(cfg, final_weights, ensemble_alphas)
+    performance = _backtest_stage(cfg, final_weights, ml_effective_alphas, data_context=data_context)
 
     # Stage 7: Reporting artifacts
     artifacts = {

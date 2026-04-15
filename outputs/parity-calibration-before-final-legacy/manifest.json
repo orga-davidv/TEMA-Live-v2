@@ -1,0 +1,7 @@
+{
+  "run_id": "parity-calibration-before-final-legacy",
+  "legacy_executed": true,
+  "artifacts": [
+    "performance"
+  ]
+}

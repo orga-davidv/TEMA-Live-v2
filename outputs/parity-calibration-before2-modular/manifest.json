@@ -1,0 +1,16 @@
+{
+  "run_id": "parity-calibration-before2-modular",
+  "timestamp": "2026-04-15T19:42:28.936268Z",
+  "artifacts": [
+    "current_weights",
+    "candidate_weights",
+    "expected_alphas",
+    "portfolio_info",
+    "ensemble_info",
+    "effective_expected_alphas",
+    "gated_weights",
+    "final_weights",
+    "ml_info",
+    "performance"
+  ]
+}

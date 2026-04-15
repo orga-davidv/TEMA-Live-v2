@@ -16,6 +16,7 @@ import runpy
 from pathlib import Path
 import re
 import json
+import csv
 
 ROOT = Path(__file__).resolve().parent
 # Ensure src is on sys.path so "tema" package can be imported
@@ -42,17 +43,52 @@ def run_legacy(run_id: str, out_root: str = "outputs"):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mf = out_dir / "manifest.json"
+    metrics_dataset = os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test")
+
+    def _write_manifest(extra: dict | None = None):
+        payload = {"run_id": run_id}
+        if extra:
+            payload.update(extra)
+        with open(mf, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2)
+
+    def _extract_legacy_performance() -> dict | None:
+        metrics_csv = legacy_path.parent / "bl_portfolio_metrics.csv"
+        if not metrics_csv.exists():
+            return None
+        with open(metrics_csv, "r", encoding="utf-8", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        if not rows:
+            return None
+        row = next((r for r in rows if str(r.get("dataset", "")).strip().lower() == metrics_dataset.lower()), rows[0])
+        def _f(name: str):
+            v = row.get(name)
+            if v is None or v == "":
+                return None
+            return float(v)
+        return {
+            "sharpe": _f("sharpe_ratio"),
+            "annual_return": _f("annualized_return"),
+            "annual_volatility": _f("annualized_volatility"),
+            "max_drawdown": _f("max_drawdown"),
+            "legacy_dataset": row.get("dataset"),
+            "legacy_metrics_source": str(metrics_csv),
+        }
     if should_exec:
         # run in its own globals to emulate script execution
         g = {"__name__": "__main__", "RUN_ID": run_id, "OUT_ROOT": out_root}
         runpy.run_path(str(legacy_path), run_name="__main__", init_globals=g)
-        # write manifest safely as JSON
-        with open(mf, 'w', encoding='utf-8') as fh:
-            json.dump({"run_id": run_id, "legacy_executed": True}, fh, indent=2)
+        perf = _extract_legacy_performance()
+        if perf is not None:
+            perf_path = out_dir / "performance.json"
+            with open(perf_path, "w", encoding="utf-8") as fh:
+                json.dump(perf, fh, indent=2)
+            _write_manifest({"legacy_executed": True, "artifacts": ["performance"]})
+        else:
+            _write_manifest({"legacy_executed": True, "note": "legacy metrics CSV not found after execution"})
     else:
         # do not execute by default; record that we skipped execution
-        with open(mf, 'w', encoding='utf-8') as fh:
-            json.dump({"run_id": run_id, "legacy_executed": False, "note": "set TEMA_RUN_LEGACY_EXECUTE=1 to actually run the legacy script"}, fh, indent=2)
+        _write_manifest({"legacy_executed": False, "note": "set TEMA_RUN_LEGACY_EXECUTE=1 to actually run the legacy script"})
 
     return {'manifest_path': str(mf), 'out_dir': str(out_dir)}
 
@@ -70,6 +106,15 @@ def run_modular(
     ml_enabled: bool = True,
     ml_modular_path_enabled: bool = False,
     ml_probability_threshold: float = 0.0,
+    data_max_assets: int = 3,
+    data_full_universe_for_parity: bool = True,
+    portfolio_method: str = "bl",
+    portfolio_risk_aversion: float = 2.5,
+    portfolio_bl_tau: float = 0.05,
+    portfolio_bl_view_confidence: float = 0.65,
+    ml_hmm_scalar_floor: float = 0.30,
+    ml_hmm_scalar_ceiling: float = 1.50,
+    vol_target_apply_to_ml: bool = False,
 ):
     from tema.pipeline import run_pipeline as rp
     from tema.config import BacktestConfig
@@ -85,6 +130,15 @@ def run_modular(
         ml_enabled=ml_enabled,
         ml_modular_path_enabled=ml_modular_path_enabled,
         ml_probability_threshold=ml_probability_threshold,
+        data_max_assets=data_max_assets,
+        data_full_universe_for_parity=data_full_universe_for_parity,
+        portfolio_method=portfolio_method,
+        portfolio_risk_aversion=portfolio_risk_aversion,
+        portfolio_bl_tau=portfolio_bl_tau,
+        portfolio_bl_view_confidence=portfolio_bl_view_confidence,
+        ml_hmm_scalar_floor=ml_hmm_scalar_floor,
+        ml_hmm_scalar_ceiling=ml_hmm_scalar_ceiling,
+        vol_target_apply_to_ml=vol_target_apply_to_ml,
     )
     return rp(run_id=run_id, cfg=cfg, out_root=out_root)
 
@@ -103,6 +157,15 @@ def main(argv=None):
     p.add_argument("--ml-disabled", action="store_true")
     p.add_argument("--ml-modular-path", action="store_true")
     p.add_argument("--ml-prob-threshold", type=float, default=0.0)
+    p.add_argument("--data-max-assets", type=int, default=3)
+    p.add_argument("--disable-full-universe-override", action="store_true")
+    p.add_argument("--portfolio-method", default="bl")
+    p.add_argument("--portfolio-risk-aversion", type=float, default=2.5)
+    p.add_argument("--portfolio-bl-tau", type=float, default=0.05)
+    p.add_argument("--portfolio-view-confidence", type=float, default=0.65)
+    p.add_argument("--ml-hmm-scalar-floor", type=float, default=0.30)
+    p.add_argument("--ml-hmm-scalar-ceiling", type=float, default=1.50)
+    p.add_argument("--vol-target-apply-to-ml", action="store_true")
     args = p.parse_args(argv)
 
     if args.legacy:
@@ -120,6 +183,15 @@ def main(argv=None):
             ml_enabled=(not args.ml_disabled),
             ml_modular_path_enabled=args.ml_modular_path,
             ml_probability_threshold=args.ml_prob_threshold,
+            data_max_assets=args.data_max_assets,
+            data_full_universe_for_parity=(not args.disable_full_universe_override),
+            portfolio_method=args.portfolio_method,
+            portfolio_risk_aversion=args.portfolio_risk_aversion,
+            portfolio_bl_tau=args.portfolio_bl_tau,
+            portfolio_bl_view_confidence=args.portfolio_view_confidence,
+            ml_hmm_scalar_floor=args.ml_hmm_scalar_floor,
+            ml_hmm_scalar_ceiling=args.ml_hmm_scalar_ceiling,
+            vol_target_apply_to_ml=args.vol_target_apply_to_ml,
         )
     print(res)
     return res

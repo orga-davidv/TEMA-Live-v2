@@ -1,0 +1,16 @@
+{
+  "run_id": "calib-281",
+  "timestamp": "2026-04-15T19:45:15.449455Z",
+  "artifacts": [
+    "current_weights",
+    "candidate_weights",
+    "expected_alphas",
+    "portfolio_info",
+    "ensemble_info",
+    "effective_expected_alphas",
+    "gated_weights",
+    "final_weights",
+    "ml_info",
+    "performance"
+  ]
+}

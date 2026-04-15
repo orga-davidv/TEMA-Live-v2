@@ -1,2 +1,2 @@
-enabled,method,auto,scalar,unclipped_scalar,train_ml_vol,target_vol,max_scalar,clipped
-True,vol_fallback,True,44.504548698370535,44.504548698370535,0.0022469613314753454,0.1,50.0,False
+enabled,method,hmm_n_states,bull_state,factor,pre_vol,post_vol,train_raw_scalar_stats,test_raw_scalar_stats,max_scalar,hmm_scalar_floor,hmm_scalar_ceiling,applied_scalar_train_mean
+True,hmm_prob_python,2,1,169.22582250229772,0.0005909263640815942,0.09807190203295311,"{'mean': 0.3012383690094486, 'median': 0.30003005716952236, 'p90': 0.30003282801815584, 'max': 1.5}","{'mean': 0.301534417233056, 'median': 0.30003007259148884, 'p90': 0.3000336525720168, 'max': 1.5}",50.0,0.3,1.5,50.0

@@ -1,2 +1,2 @@
 enabled,reference,reference_train_vol,fallback_used,scalar,unclipped_scalar,target_vol,min_leverage,max_leverage,clipped,apply_to_ml
-True,bl,0.01604249363590084,False,6.23344489139856,6.23344489139856,0.1,0.25,12.0,False,False
+True,bl,0.016072958129906237,False,6.221630093961015,6.221630093961015,0.1,0.25,12.0,False,False

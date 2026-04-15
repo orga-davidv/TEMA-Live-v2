@@ -1,0 +1,10 @@
+{
+  "ml_enabled": true,
+  "modular_path_enabled": false,
+  "scalar": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "notes": "legacy pass-through path (feature flag off)"
+}

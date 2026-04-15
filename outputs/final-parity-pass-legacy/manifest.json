@@ -1,0 +1,7 @@
+{
+  "run_id": "final-parity-pass-legacy",
+  "legacy_executed": true,
+  "artifacts": [
+    "performance"
+  ]
+}
