@@ -1,0 +1,916 @@
+================================================================================
+TEMA-Live-v2: GAP AUDIT
+Monolith vs. Modular Code Analysis
+Generated: 2025-01-25
+================================================================================
+
+EXECUTIVE SUMMARY
+================================================================================
+The monolith TEMA-TEMPLATE(NEW_).py (2,123 lines) is a comprehensive portfolio
+optimization pipeline with ML filtering, Black-Litterman rebalancing, and risk
+management. The src/tema module structure exists (13 subdirectories) but contains
+NO TRACKED SOURCE FILES—only Python cache artifacts. A complete modularization
+effort is needed.
+
+This audit maps the monolith's capability areas and proposes extraction tasks.
+
+================================================================================
+KEY CAPABILITY AREAS IN MONOLITH
+================================================================================
+
+1. CONFIGURATION & PARAMETERS (BacktestConfig dataclass)
+   Lines: 20-100
+   Fields: ~60 config parameters including:
+   - Data source & train/test split (data_dir, train_ratio)
+   - Trading mechanics (fee_rate, slippage_rate, freq, batch_size)
+   - Min trades, history validation (min_trades_per_year, min_history_rows)
+   - Grid search params (ema periods, grid_validation_ratio, grid_overfit_penalty)
+   - Turnover control (rebalance_min_threshold, cost_aware_rebalance flags & multipliers)
+   - Black-Litterman parameters (bl_tau, bl_delta, bl_omega_scale, bl_max_weight)
+   - ML/HMM feature generation (hmm_n_states, hmm_n_iter, hmm_var_floor, hmm_trans_sticky)
+   - RF classifier params (rf_n_estimators, rf_max_depth, rf_min_samples_leaf)
+   - ML thresholding (ml_prob_threshold, ml_auto_threshold, ml_target_exposure)
+   - ML position scalar (ml_position_scalar_method, ml_hmm_scalar_floor/ceiling, ml_position_scalar_auto)
+   - Vol-target scaling (vol_target_enabled, vol_target_annual, vol_target_max/min_leverage)
+   - Vol-target reference selection (vol_target_reference, vol_target_apply_to_ml)
+   - ML grid search (ml_grid_search_enabled, grid parameter tuples)
+   Status: KEY—must be extracted as-is to src/tema/config.py or similar
+
+2. C++ WRAPPER LAYERS
+   Lines: 118-312
+   Classes:
+   - CppSignalEngine: wrapper for grid_signals.cpp (EMA crossover generation)
+   - CppHmmEngine: wrapper for hmm_regime.cpp (HMM fit + forward prob inference)
+   Functions:
+   - compile_cpp_signal_library(), compile_cpp_hmm_library()
+   Status: PARTIALLY IMPLEMENTED (src/tema/cpp/__pycache__ suggests wrapper exists)
+           Need verification of actual source files in src/tema/cpp/
+
+3. SIGNAL GENERATION & GRID SEARCH
+   Lines: 315-672
+   Core logic:
+   - generate_ema_combinations(): enumerate EMA period combos with early filtering
+   - ema_series(): pandas-based EMA computation
+   - crossed_above(), crossed_below(): crossover detection
+   - precompute_ema_matrix(): pre-cache EMA values for batch processing
+   - verify_cpp_matches_python_signals(): parity test (sample 100 combos)
+   - _init_worker(), _extract_rows_from_stats(): parallel grid search setup
+   - _process_batch(): per-batch combo evaluation
+   - run_parallel_grid_search_cpp(): process pool orchestration with ETA tracking
+   
+   Key metrics computed per combo:
+   - Sharpe ratio, total return, max drawdown (via simulate_batch_returns_and_stats)
+   - Trade statistics (win rate, profit factor, expectancy)
+   - Turnover & cost tracking (annualized_turnover, annual_costs)
+   
+   Status: PARTIAL
+   - Signal primitives (EMA, crossovers) trivial to modularize
+   - Parallel grid orchestration needs careful extraction
+   - C++ parity checking framework present but C++ files location unclear
+
+4. ASSET LOADING & PREPROCESSING
+   Lines: 734-796
+   Functions:
+   - list_asset_files(): discover *_d1_merged.csv files
+   - count_csv_rows_fast(): quick row count (optimization)
+   - prefilter_assets_by_min_rows(): drop assets with insufficient history
+   - parse_asset_name(): extract asset ticker from file path
+   - load_close_series_from_csv(): load price series with date parsing
+   - split_train_test(): chronological train/test split
+   
+   Status: IMPLEMENTED in src/tema/data/ (cache artifacts visible)
+           Needs verification of splitter, loader, validators modules
+
+5. STRATEGY RETURNS & BACKTEST SIMULATION
+   Lines: 350-531, 804-892
+   Core functions:
+   - simulate_batch_returns_and_stats(): vectorized backtest for N combos
+     * Position tracking (entry/exit signals)
+     * Fee & slippage deduction
+     * Turnover tracking (absolute position changes)
+     * Trade-level statistics (closed trade analysis)
+     * Returns aggregation (total, annualized, Sharpe, Sortino, etc.)
+   
+   - build_strategy_returns_for_combo(): single asset + combo evaluation
+   - annualize_return_from_series(): compound annual growth rate
+   
+   Status: PARTIAL
+   - Backtest engine complex, tightly coupled to grid search
+   - Trade analytics embedded in returns computation
+   - Risk metrics (drawdown, Sortino) inlined
+
+6. BEST COMBO SELECTION (Out-of-Sample Validation)
+   Lines: 834-892
+   - choose_best_combo_with_validation():
+     * Subtrain (60% of train) for combo ranking
+     * Validation (40% of train) for overfitting penalty
+     * Blended selection score: subtrain_sharpe - grid_overfit_penalty * val_sharpe
+   
+   Status: MISSING (not found in modular layer)
+           Essential for generalization; must extract as task
+
+7. BLACK-LITTERMAN PORTFOLIO CONSTRUCTION
+   Lines: 902-974
+   - build_black_litterman_weights():
+     * Compute covariance matrix (annualized from train returns)
+     * Market equilibrium prior (BL delta parameter)
+     * Views matrix (identity) + view returns (annualized strategy Sharpe proxies)
+     * Posterior mean update (closed-form BL formula)
+     * Long-only + weight capping projection (iterative)
+     * Normalization & safety handling
+   
+   Status: PARTIAL
+   - Black-Litterman framework present in src/tema/portfolio/
+     (cache artifact visible)
+   - Verify completeness: weight capping, view construction
+
+8. PORTFOLIO EVALUATION & METRICS
+   Lines: 977-1012
+   - evaluate_weighted_portfolio():
+     * Weighted portfolio return series
+     * Cumulative equity curve computation
+     * Drawdown analysis (peak, dd series, max_dd)
+     * Annualized return, volatility, Sharpe ratio, max drawdown
+   
+   Status: PARTIAL
+   - src/tema/risk/backtest/metrics.py likely has this
+     Verify: metric naming consistency, edge cases (empty portfolios, div by zero)
+
+9. TURNOVER & COST-AWARE REBALANCING GATES
+   Lines: 1429-1520
+   - apply_turnover_reduction_gates():
+     * Expected alpha computation from recent strategy returns (lookback window)
+     * Cost comparison: alpha vs. (expected costs * multiplier)
+     * Gate logic: only update weights if gate passes
+     * Diagnostic tracking (gates applied, alpha, costs)
+   
+   Status: MISSING
+   - Not found in src/tema/portfolio/ or src/tema/risk/
+   - Critical for phase 2b (turnover optimization)
+   - Must extract with risk quantification
+
+10. VOLATILITY-TARGET SCALING (Train-based)
+    Lines: 1014-1100
+    - compute_and_apply_vol_target():
+      * Configurable reference series selection (ML-filtered vs. BL)
+      * Realized train volatility computation (annualized, 252-day basis)
+      * Scale factor: target_vol / realized_train_vol
+      * Leverage clipping: [vol_target_min_leverage, vol_target_max_leverage]
+      * Optional application to ML-filtered returns (separate scalar vs. global)
+      * Comprehensive diagnostics (reference used, clipping flags, etc.)
+    
+    Status: PARTIAL
+    - src/tema/scaling/vol_target.py exists (cache visible)
+    - Verify: reference selection logic, fallback behavior, diagnostic completeness
+
+11. ML FEATURE GENERATION & HMM STATE FILTERING
+    Lines: 1103-1519, 1520-1613
+    - compute_and_apply_ml_position_scalar():
+      * HMM state probability extraction (bull/bear regime proxy)
+      * Optional scalar shaping: floor + (ceiling - floor) * p_bull
+      * Annualized target volatility rescaling for ML positions
+      * Safety cap (ml_position_scalar_max)
+      * Comprehensive diagnostics (HMM state dist, scalar breakdown)
+    
+    - apply_hmm_softprob_rf_strategy():
+      * HMM fit on train returns → train/test state probabilities
+      * RF feature matrix: prior entry signals, volatility, HMM probs, seasonality
+      * RF classifier training on BL portfolio returns (target: bull/bear)
+      * Probability threshold calibration (soft targeting) or hard thresholding
+      * Position scaling: [ml_target_exposure * p_bull, p_bull]
+      * Return filtering: scaled portfolio returns
+    
+    Status: PARTIAL
+    - src/tema/ml/ subdirectories exist (hmm.py, random_forest.py, etc.)
+    - Verify: feature builder completeness, RF integration, threshold logic
+
+12. ML PARAMETER GRID SEARCH
+    Lines: 1614-1707
+    - run_ml_parameter_grid_search():
+      * Grid: RF n_estimators, max_depth, min_samples_leaf, target_exposure, HMM states
+      * Per-point: train RF, apply to test, compute Sharpe
+      * Results DataFrame (test_sharpe_ratio, parameters)
+      * Top N selection for model selection
+    
+    Status: PARTIAL
+    - src/tema/signals/grid_search.py visible in cache
+    - Verify: grid sweep logic, metric computation consistency
+
+13. ASSET-LEVEL PIPELINE ORCHESTRATION
+    Lines: 1717-1793
+    - run_asset_pipeline():
+      * Load asset, train/test/subtrain/val split
+      * C++ parity check (first asset only)
+      * Best combo selection via validation set
+      * Strategy returns for train/test
+      * Summary DataFrame row (asset + metrics + best combo)
+    
+    Status: PARTIAL
+    - Pipeline runner logic in src/tema/pipeline/runner.py (cache visible)
+    - Verify: data flow consistency, error handling
+
+14. MAIN ORCHESTRATION & REPORTING
+    Lines: 1796-2123
+    - main():
+      * Config initialization + environment override support (REB_MIN_THRESHOLD, etc.)
+      * Parallel worker pool (per-asset processing)
+      * Asset filtering + progress reporting with ETA
+      * Multi-asset aggregation (concat returns, build BL weights)
+      * ML pipeline (optional grid search + filtering)
+      * Vol-target scaling (train-based, both BL + ML)
+      * Metric recomputation after scaling
+      * Comprehensive CSV output (summaries, weights, returns, metrics, diagnostics)
+      * Chart generation (equity curves, train vs. test, BL vs. ML)
+    
+    Status: PARTIAL
+    - src/tema/pipeline/cli.py + runner.py visible in cache
+    - Verify: orchestration completeness, error handling, logging
+
+15. REPORTING & VISUALIZATION
+    Lines: 1349-1361, 2017-2081
+    - save_equity_curve_chart():
+      * Matplotlib-based equity curve rendering
+      * Multi-strategy comparison (BL, ML, equal-weight, buy-and-hold)
+      * Configurable title + legend
+    
+    - Output artifacts:
+      * asset_strategy_summary.csv (per-asset best combo + metrics)
+      * black_litterman_weights.csv (portfolio weights)
+      * portfolio_train/test_returns.csv (BL portfolio series)
+      * portfolio_train/test_returns_ml.csv (ML-filtered series)
+      * ml_hmm_state_params.csv (HMM diagnostics)
+      * ml_diagnostics.csv (ML threshold calibration)
+      * ml_parameter_grid_results.csv (full grid search)
+      * ml_parameter_grid_top10.csv (best 10)
+      * equity_curve_train/test_comparison.png
+      * bl_portfolio_metrics.csv (final metrics across datasets)
+    
+    Status: PARTIAL
+    - src/tema/reporting/ structure exists
+    - Verify: artifact naming, metric consistency
+
+================================================================================
+MAPPING TO src/tema MODULES
+================================================================================
+
+Module Structure (directories exist, source files TBD):
+├── config.py / config_loader.py         ← BacktestConfig, GridConfig
+├── cpp/
+│   └── _cpp_wrapper.py                  ← CppSignalEngine, CppHmmEngine
+├── data/
+│   ├── loader.py                        ← load_close_series_from_csv, list_asset_files
+│   ├── splitter.py                      ← split_train_test, prefilter_assets_by_min_rows
+│   └── validators.py                    ← count_csv_rows_fast, validation logic
+├── ml/
+│   ├── hmm.py                           ← HMM fit/inference (wraps CppHmmEngine)
+│   ├── feature_builder.py               ← build_rf_feature_matrix
+│   ├── random_forest.py                 ← RF classifier training/prediction
+│   ├── threshold.py                     ← calibrate_soft_threshold_for_target_exposure
+│   └── ensemble.py                      ← combined HMM + RF pipeline
+├── pipeline/
+│   ├── cli.py                           ← command-line interface
+│   ├── runner.py                        ← main() orchestration
+│   └── __init__.py
+├── portfolio/
+│   ├── black_litterman.py               ← build_black_litterman_weights
+│   └── rebalancer.py                    ← cost-aware gating, turnover control
+├── reporting/
+│   ├── artifacts.py                     ← output file management
+│   ├── charts.py                        ← save_equity_curve_chart
+│   ├── comparison.py                    ← multi-strategy metrics
+│   └── __init__.py
+├── risk/
+│   ├── backtest/
+│   │   └── metrics.py                   ← evaluate_weighted_portfolio
+│   ├── tail_risk.py                     ← CVaR, copula tail (not in monolith?)
+│   ├── cvar_monitor.py                  ← conditional value at risk
+│   └── risk_budget.py                   ← risk allocation
+├── scaling/
+│   ├── vol_target.py                    ← compute_and_apply_vol_target
+│   ├── ml_position_scalar.py            ← compute_and_apply_ml_position_scalar
+│   └── dynamic_scaler.py                ← general scaling orchestration
+├── signals/
+│   ├── ema.py                           ← ema_series, crossed_above/below
+│   ├── grid_search.py                   ← run_parallel_grid_search_cpp
+│   ├── oos_selection.py                 ← choose_best_combo_with_validation
+│   └── __init__.py
+├── validation/
+│   ├── parity.py                        ← verify_cpp_matches_python_signals
+│   └── __init__.py
+├── dashboard/
+│   ├── app.py, models.py, loader.py     ← web UI (not in monolith)
+│   └── pages/
+└── __init__.py
+
+================================================================================
+CAPABILITY AREAS: STATUS CLASSIFICATION
+================================================================================
+
+IMPLEMENTED (likely complete, needs verification):
+  ✓ Data loading (loader.py, splitter.py, validators.py)
+  ✓ EMA signal generation (signals/ema.py)
+  ✓ Portfolio metrics (risk/backtest/metrics.py)
+  ✓ Black-Litterman construction (portfolio/black_litterman.py)
+  ✓ Vol-target scaling (scaling/vol_target.py)
+  ✓ ML HMM/RF pipeline (ml/hmm.py, ml/random_forest.py)
+  ✓ ML parameter grid (signals/grid_search.py)
+  ✓ C++ wrappers (cpp/_cpp_wrapper.py)
+  ✓ Reporting structure (reporting/)
+  ✓ Validation parity (validation/parity.py)
+
+PARTIAL (incomplete or unverified):
+  ⚠ Config management: BacktestConfig dataclass exists but integration unclear
+  ⚠ Pipeline orchestration: main() logic may be split across cli/runner
+  ⚠ ML position scalar: scaling logic may be incomplete
+  ⚠ Grid search orchestration: parallel worker setup may be missing
+  ⚠ Equity curve visualization: charts.py may lack matplotlib integration
+  ⚠ Diagnostic CSV output: reporting completeness uncertain
+  ⚠ Environment config overrides: cli may not support REB_MIN_THRESHOLD style vars
+
+MISSING (not found in modular code):
+  ✗ Turnover-aware rebalancing gates (apply_turnover_reduction_gates)
+  ✗ Cost-aware rebalancing logic (cost-aware gating framework)
+  ✗ Out-of-sample combo selection (choose_best_combo_with_validation)
+  ✗ Asset pipeline runner (run_asset_pipeline orchestration)
+  ✗ Multi-asset return aggregation (concat, fillna logic)
+  ✗ Grid validation logic (subtrain/val split with overfitting penalty)
+  ✗ Turnover reduction gates (Phase 2b cost awareness)
+  ✗ HMM state diagnostics export (ml_hmm_state_params.csv)
+  ✗ Per-combo validation metrics export
+  ✗ Risk budget allocation (risk/risk_budget.py incomplete?)
+
+================================================================================
+EXTRACTION TASKS FOR MISSING/PARTIAL COMPONENTS
+================================================================================
+
+PRIORITY 1: CRITICAL (blocks main pipeline)
+═══════════════════════════════════════════════════════════════════════════════
+
+TASK 1.1: Extract Asset Pipeline Orchestration
+File: src/tema/pipeline/runner.py → run_asset_pipeline()
+Source: TEMA-TEMPLATE(NEW_).py lines 1717-1793
+
+Description:
+  Modularize the per-asset pipeline: load → split → validate combo selection →
+  build strategy returns → metrics aggregation.
+
+Scope:
+  - Extract run_asset_pipeline() as-is
+  - Dependency: choose_best_combo_with_validation() [MISSING]
+  - Dependency: build_strategy_returns_for_combo()
+  - Handle validation set split (subtrain/val with overfitting penalty)
+  
+Risk Notes:
+  - Tight coupling to BacktestConfig: ensure config injection points
+  - C++ parity checking: runs only first asset (singleton pattern needed)
+  - Return tuple unpacking: standardize summary dict schema
+
+Files involved:
+  - src/tema/pipeline/runner.py (create or extend)
+  - src/tema/data/splitter.py (extend for subtrain/val split)
+
+
+TASK 1.2: Extract Out-of-Sample Combo Selection
+File: src/tema/signals/oos_selection.py → choose_best_combo_with_validation()
+Source: TEMA-TEMPLATE(NEW_).py lines 834-892
+
+Description:
+  Implement generalization-aware best combo selection using subtrain/val split
+  with overfitting penalty (grid_overfit_penalty parameter).
+
+Scope:
+  - Subtrain (60% of train): rank combos by Sharpe
+  - Validation (40% of train): penalize overfitting (blended score)
+  - Return best combo + selection diagnostics (subtrain_sharpe, val_sharpe, score)
+  
+Risk Notes:
+  - Magic number: 60/40 split hardcoded; parameterize in config
+  - Selection score formula: subtrain_sharpe - penalty * val_sharpe (crucial)
+  - Edge case: no valid combos after filtering (must raise/handle)
+  - Dependency: grid search results (combo labels, metrics)
+
+Files involved:
+  - src/tema/signals/oos_selection.py (NEW)
+  - src/tema/config.py (add grid_validation_* parameters if missing)
+
+
+TASK 1.3: Extract Turnover-Aware Rebalancing Gates
+File: src/tema/portfolio/rebalancer.py → apply_turnover_reduction_gates()
+Source: TEMA-TEMPLATE(NEW_).py lines 1429-1520
+
+Description:
+  Implement cost-aware weight gating: only update BL weights if expected alpha
+  exceeds expected costs * multiplier. Critical for Phase 2b.
+
+Scope:
+  - Expected alpha proxy: rolling annualized return (lookback configurable)
+  - Expected costs: BL weight change magnitude * (fee_rate + slippage_rate)
+  - Gate logic: update weights only if alpha > costs * cost_aware_rebalance_multiplier
+  - Track diagnostics: gates triggered, alpha_proxy, expected_costs
+  - If gate fails: keep previous weights (no-op rebalance)
+  
+Risk Notes:
+  - Alpha proxy crude: uses strategy returns, not factor-based alpha
+  - Lookback window hardcoded (20 periods?); must parameterize
+  - Diagnostic tracking essential for ablation experiments
+  - Integration point: apply post-BL, pre-vol-target scaling
+  - Test coverage critical: edge cases (NaN returns, thin lookback history)
+
+Files involved:
+  - src/tema/portfolio/rebalancer.py (NEW or extend black_litterman.py)
+  - src/tema/config.py (add cost_aware_rebalance_* parameters)
+
+
+TASK 1.4: Extract Grid Validation & Subtrain/Val Split
+File: src/tema/data/splitter.py → grid_validation_split()
+Source: TEMA-TEMPLATE(NEW_).py lines 1732-1735, 834-850
+
+Description:
+  Implement robust train/subtrain/val split for grid search with overfitting
+  penalty logic.
+
+Scope:
+  - Input: train_close (80% of all data after train/test split)
+  - Output: subtrain_close, val_close with configurable ratio
+  - Validation set minimum rows: grid_validation_min_rows (default 80)
+  - Validation ratio clamping: grid_validation_ratio (default 0.25, i.e., 20/80)
+  
+Risk Notes:
+  - Chronological order: CRITICAL (no look-ahead bias)
+  - Edge cases: too few rows for val set → adjust split dynamically
+  - Parameter interactions: train_ratio * (1 - grid_validation_ratio) must ≥ min_rows
+
+Files involved:
+  - src/tema/data/splitter.py (extend split_train_test)
+
+
+PRIORITY 2: HIGH (major gaps in capability areas)
+═══════════════════════════════════════════════════════════════════════════════
+
+TASK 2.1: Verify & Complete ML Position Scalar
+File: src/tema/scaling/ml_position_scalar.py → compute_and_apply_ml_position_scalar()
+Source: TEMA-TEMPLATE(NEW_).py lines 1103-1346
+
+Description:
+  Ensure ML-specific position scaling is complete: HMM probability → scalar
+  mapping with optional annualized vol targeting.
+
+Scope:
+  - HMM state probability extraction (bull regime proxy: p_bull)
+  - Scalar computation method (ml_position_scalar_method, default "hmm_prob"):
+    * "hmm_prob": scalar = floor + (ceiling - floor) * p_bull
+    * Other methods: flat or vol-target-based?
+  - Optional annualized vol-target rescaling (ml_position_scalar_target_vol)
+  - Safety cap: ml_position_scalar_max (default 50.0)
+  - Comprehensive diagnostics: p_bull distribution, scalar breakdown, applied positions
+  
+Risk Notes:
+  - Non-linear scalar can cause leverage spikes
+  - Separate from global vol-target (vol_target_apply_to_ml flag)
+  - Integration: applied before global vol-target in main()
+  - Diagnostic CSV output essential for debugging
+
+Files involved:
+  - src/tema/scaling/ml_position_scalar.py (verify/complete)
+  - src/tema/config.py (ensure all ml_position_scalar_* params exist)
+
+
+TASK 2.2: Extract Multi-Asset Orchestration & Aggregation
+File: src/tema/pipeline/runner.py → main() [partial]
+Source: TEMA-TEMPLATE(NEW_).py lines 1875-1924
+
+Description:
+  Implement multi-asset loop with error handling, progress tracking, and
+  return aggregation (concat, fillna logic).
+
+Scope:
+  - Asset file discovery + filtering (min_history_rows)
+  - Parallel asset processing (ProcessPoolExecutor)
+  - Per-asset error handling (skip on exception)
+  - Progress reporting with ETA calculation
+  - Return aggregation:
+    * Stack individual returns into DataFrames
+    * Fill NaN with 0 (assumption: asset not traded on that day)
+    * Ensure index alignment (sorted, reindexed)
+  - Summary DataFrame assembly + top-down sorting
+  
+Risk Notes:
+  - Error suppression can hide issues: add detailed logging
+  - NaN fill strategy (0 vs. ffill?) critical for portfolio construction
+  - ETA calculation can overflow on slow first assets
+  - Parallel chunk coordination: ensure global state isolation (parity_checked flag)
+
+Files involved:
+  - src/tema/pipeline/runner.py (extend orchestration)
+  - src/tema/data/loader.py (ensure list_asset_files + prefilter exports)
+
+
+TASK 2.3: Extract HMM Diagnostics & State Params Export
+File: src/tema/ml/hmm.py + src/tema/reporting/artifacts.py
+Source: TEMA-TEMPLATE(NEW_).py lines 1965-1975 (apply_hmm_softprob_rf_strategy)
+        + lines 2037-2040 (export ml_state_df)
+
+Description:
+  Ensure HMM state parameters (means, variances, state assignments) are
+  tracked and exported to CSV for diagnostics.
+
+Scope:
+  - HMM fit output: train_states, test_states, means, variances, probs
+  - DataFrame: rows=dates, cols=hmm_state, hmm_prob_bull, hmm_prob_bear, etc.
+  - Export path: ml_hmm_state_params.csv
+  - Diagnostics dict: state distribution, probability percentiles, regime transitions
+  
+Risk Notes:
+  - HMM output schema: must match ML filtering expectations
+  - State labeling: which state = bull? (parameterize)
+  - Probability aggregation: forward probs vs. Viterbi states (clarify)
+
+Files involved:
+  - src/tema/ml/hmm.py (ensure state tracking)
+  - src/tema/reporting/artifacts.py (add ml_state_df export)
+
+
+TASK 2.4: Extract Grid Search Orchestration (Parallel)
+File: src/tema/signals/grid_search.py → run_parallel_grid_search_cpp()
+Source: TEMA-TEMPLATE(NEW_).py lines 672-732
+
+Description:
+  Verify parallel grid search implementation with worker initialization,
+  batch processing, and result aggregation.
+
+Scope:
+  - Worker pool initialization: global state (close, EMA matrix, C++ engine, config)
+  - Batch chunking: slice combos into max_workers chunks
+  - Per-batch processing: run_asset_pipeline → simulate_batch_returns_and_stats
+  - Result aggregation: concat batch results, sort by score
+  - Parity checking: verify C++ vs. Python signals (sample-based)
+  
+Risk Notes:
+  - Global state management in _init_worker: thread-safe? (use multiprocessing)
+  - Batch size: may need tuning for memory/latency trade-off
+  - Result schema: ensure consistency (metric naming, NaN handling)
+  - Parity check overhead: 100-sample default, but CPU time impact unclear
+
+Files involved:
+  - src/tema/signals/grid_search.py (verify/complete)
+  - src/tema/cpp/_cpp_wrapper.py (ensure engine consistency)
+
+
+TASK 2.5: Extract Config Loader with Environment Overrides
+File: src/tema/config_loader.py → resolve config + environment overrides
+Source: TEMA-TEMPLATE(NEW_).py lines 1804-1816
+
+Description:
+  Implement config loading with environment variable override support for
+  lightweight ablation experiments.
+
+Scope:
+  - Supported env vars:
+    * REB_MIN_THRESHOLD → cfg.rebalance_min_threshold
+    * COST_AWARE_REBALANCE → cfg.cost_aware_rebalance (bool)
+    * COST_AWARE_REBALANCE_MULTIPLIER → cfg.cost_aware_rebalance_multiplier
+    * TURNOVER_PENALTY_LAMBDA → cfg.turnover_penalty_lambda
+  - Config instantiation: BacktestConfig() + overrides
+  - Error handling: warn on invalid override, continue with default
+  
+Risk Notes:
+  - Environment variable naming convention: must be stable
+  - Type coercion: float/bool parsing can fail (implement try-except)
+  - Documentation: must list all available overrides
+
+Files involved:
+  - src/tema/config_loader.py (NEW)
+  - src/tema/config.py (ensure BacktestConfig definition complete)
+
+
+PRIORITY 3: MEDIUM (important for completeness)
+═══════════════════════════════════════════════════════════════════════════════
+
+TASK 3.1: Extract Turnover-Based Penalty in Grid Search
+File: src/tema/signals/grid_search.py (extend)
+Source: TEMA-TEMPLATE(NEW_).py lines 404-402 (simulate_batch_returns_and_stats)
+        + config: turnover_penalty_lambda
+
+Description:
+  Implement turnover penalty in combo selection: Sharpe - lambda * annualized_turnover.
+  Currently annualized_turnover is computed but not used in selection score.
+
+Scope:
+  - Turnover penalty: reduce combo Sharpe by lambda * annualized_turnover
+  - Only applied if turnover_penalty_lambda > 0
+  - Selection score: max(Sharpe - lambda * turnover, floor=0)
+  - Diagnostic: export per-combo turnover for ablation analysis
+  
+Risk Notes:
+  - Lambda tuning critical: affects selection dramatically (recommend sensitivity analysis)
+  - Turnover definition: absolute position changes vs. notional turnover (clarify)
+  - Interaction with OOS selection: does penalty apply to subtrain/val as well?
+
+Files involved:
+  - src/tema/signals/grid_search.py (integrate turnover penalty)
+  - src/tema/signals/oos_selection.py (apply penalty in blended score)
+
+
+TASK 3.2: Extract Cost-Aware Rebalancing Diagnostics
+File: src/tema/reporting/artifacts.py (extend)
+Source: TEMA-TEMPLATE(NEW_).py lines 1429-1520
+
+Description:
+  Ensure cost-aware rebalancing gate decisions and diagnostics are persisted.
+
+Scope:
+  - Gate decisions DataFrame: date, gate_triggered (bool), alpha_proxy, expected_costs
+  - Gate statistics: % gates triggered, avg alpha vs. costs
+  - Diagnostic CSV: rebalancing_gates_diagnostics.csv
+  
+Risk Notes:
+  - Disk I/O: only needed if cost_aware_rebalance enabled
+  - Integration: must align with weight update timeline
+
+Files involved:
+  - src/tema/reporting/artifacts.py (add gate diagnostics export)
+
+
+TASK 3.3: Extract Equity Curve Visualization
+File: src/tema/reporting/charts.py → save_equity_curve_chart()
+Source: TEMA-TEMPLATE(NEW_).py lines 1349-1368
+
+Description:
+  Verify matplotlib-based multi-strategy equity curve rendering.
+
+Scope:
+  - Input: dict of {strategy_name: return_series}
+  - Cumulative equity computation: cumprod(1 + returns)
+  - Multi-line plot: one per strategy, legend, grid, labels
+  - Export: PNG with configurable DPI/figsize
+  
+Risk Notes:
+  - Matplotlib backend: 'Agg' hardcoded (headless operation)
+  - Figure cleanup: must close() to avoid memory leaks
+  - Color palette: ensure adequate contrast for all strategies
+
+Files involved:
+  - src/tema/reporting/charts.py (verify/complete)
+
+
+TASK 3.4: Extract Risk Budget Allocation
+File: src/tema/risk/risk_budget.py
+Source: Not in monolith (gap analysis)
+
+Description:
+  Implement risk budget allocation framework (if required by specification).
+  Currently no explicit risk budget logic in monolith.
+
+Scope:
+  - Risk contribution per asset (estimated via Hessian or risk-parity formula)
+  - Risk budget allocation: target_risk_per_asset = portfolio_risk / n_assets (simple)
+  - Risk scaling: adjust weights to match budget
+  - Diagnostics: actual vs. target risk per asset
+  
+Risk Notes:
+  - May be out of scope if not explicitly required
+  - Integration point: post-BL, pre-vol-target scaling (TBD)
+
+Files involved:
+  - src/tema/risk/risk_budget.py (define requirements first)
+
+
+TASK 3.5: Extract Seasonality & Calendar Features
+File: src/tema/signals/features.py (if ML requires it)
+Source: Not in monolith; infer from ml/feature_builder.py
+
+Description:
+  If RF feature matrix includes day-of-week, month, or other calendar features,
+  ensure they are properly generated.
+
+Scope:
+  - Calendar features: DayOfWeek, Month, Quarter, IsMonthEnd, etc.
+  - Feature normalization: scale to [0, 1] or standardize
+  - Integration: feed into RF classifier alongside HMM probs + entry signals
+  
+Risk Notes:
+  - Feature engineering is experimental; document assumptions
+  - Overfitting risk: calendar seasonality may be spurious
+
+Files involved:
+  - src/tema/ml/feature_builder.py (verify calendar feature generation)
+
+
+PRIORITY 4: LOW (polish & optimization)
+═══════════════════════════════════════════════════════════════════════════════
+
+TASK 4.1: Extract Parity Verification Framework
+File: src/tema/validation/parity.py → verify_cpp_matches_python_signals()
+Source: TEMA-TEMPLATE(NEW_).py lines 540-578
+
+Description:
+  Verify parity check completeness: EMA crossover signals (Python vs. C++).
+
+Scope:
+  - Sample-based comparison (parity_sample_size = 100)
+  - Runs once per pipeline (parity_checked flag)
+  - Error on mismatch: detailed breakdown (entry_diff, exit_diff)
+  
+Risk Notes:
+  - Sample size: 100 is arbitrary; consider coverage vs. overhead
+  - Signal generation: Python uses pandas shift(1) vs. C++ logic (ensure alignment)
+
+Files involved:
+  - src/tema/validation/parity.py (verify/complete)
+
+
+TASK 4.2: Extract C++ Compilation & Caching
+File: src/tema/cpp/_cpp_wrapper.py → compile_cpp_signal_library(), compile_cpp_hmm_library()
+Source: TEMA-TEMPLATE(NEW_).py lines 274-312
+
+Description:
+  Verify C++ build orchestration with mtime-based invalidation.
+
+Scope:
+  - Compiler: g++ -O3 -std=c++17 -fPIC -shared (with -fopenmp for grid signals)
+  - Caching: rebuild if .cpp mtime > .so mtime
+  - Error handling: subprocess.run(check=True) on build failure
+  
+Risk Notes:
+  - Compiler availability: g++ may not be in PATH (add setup docs)
+  - Platform compatibility: .so format Linux-specific (add comments)
+
+Files involved:
+  - src/tema/cpp/_cpp_wrapper.py (verify/complete)
+
+
+TASK 4.3: Extract Data Validation & Null Handling
+File: src/tema/data/validators.py
+Source: TEMA-TEMPLATE(NEW_).py lines 734-796
+
+Description:
+  Ensure data loading is robust: missing files, malformed CSVs, NaN fills.
+
+Scope:
+  - CSV parsing: handle date index, float columns
+  - NaN handling: fillna(0.0) strategy (document assumption)
+  - Asset filtering: count_csv_rows_fast, min_history_rows check
+  
+Risk Notes:
+  - count_csv_rows_fast: assumes no header in count? (clarify)
+  - Date parsing: ensure consistent timezone handling
+
+Files involved:
+  - src/tema/data/validators.py (verify/complete)
+
+
+================================================================================
+SUMMARY TABLE: STATUS BY CAPABILITY AREA
+================================================================================
+
+Area                                    Status    Extraction Task(s)
+────────────────────────────────────────────────────────────────────────────────
+Configuration & Parameters              PARTIAL   1.4 (Grid validation split)
+C++ Wrappers                            PARTIAL   4.2 (Verify compilation)
+Signal Generation & Grid Search         PARTIAL   1.2 (OOS selection)
+                                                  2.4 (Parallel orchestration)
+                                                  3.1 (Turnover penalty)
+                                                  4.1 (Parity verification)
+Asset Loading & Preprocessing           PARTIAL   4.3 (Data validation)
+Strategy Returns & Backtest Simulation  PARTIAL   (Verify implementation)
+Best Combo Selection                    MISSING   1.2 ⭐ CRITICAL
+Black-Litterman Construction            PARTIAL   (Verify completeness)
+Portfolio Evaluation & Metrics          PARTIAL   (Verify metrics consistency)
+Turnover & Cost-Aware Rebalancing       MISSING   1.3 ⭐ CRITICAL (Phase 2b)
+Volatility-Target Scaling               PARTIAL   (Verify logic)
+ML Feature Generation & HMM Filtering   PARTIAL   2.1 (ML position scalar)
+                                                  2.3 (HMM diagnostics)
+ML Parameter Grid Search                PARTIAL   (Verify grid sweep)
+Asset-Level Pipeline Orchestration      MISSING   1.1 ⭐ CRITICAL
+Main Orchestration & Reporting          PARTIAL   2.2 (Multi-asset loop)
+                                                  2.5 (Config loader + env override)
+Reporting & Visualization               PARTIAL   3.2 (Gate diagnostics)
+                                                  3.3 (Charts)
+
+⭐ = Blocking critical path
+────────────────────────────────────────────────────────────────────────────────
+
+================================================================================
+RISK ASSESSMENT
+================================================================================
+
+HIGH RISK:
+  1. Cost-aware rebalancing (1.3): Alpha proxy crude; lookback poorly specified
+  2. Turnover penalty (3.1): Lambda tuning highly experimental; interaction with OOS unclear
+  3. Parallel worker isolation (2.4): Global state management; test thoroughly
+  4. NaN handling (4.3): fillna(0.0) strategy may introduce bias; document assumptions
+  5. ML position scalar (2.1): Non-linear scaling can cause leverage spikes; cap essential
+
+MEDIUM RISK:
+  1. Grid validation logic (1.4): Hardcoded ratios may not suit all data frequencies
+  2. Environment overrides (2.5): Type coercion can fail; add robust parsing
+  3. HMM state labeling (2.3): Which state = bull? Must be consistent
+  4. Equity curve visualization (3.3): Memory leaks if plt.close() missing
+  5. Parity sample size (4.1): 100-sample coverage insufficient for edge cases
+
+LOW RISK:
+  1. EMA computation (signals/ema.py): Trivial logic; low failure likelihood
+  2. Config parameters (1.4): Dataclass-based; type-safe
+  3. CSV output (reporting): Pandas-native; low error rate
+  4. C++ compilation (4.2): Standard setup; good error messages
+
+================================================================================
+BLOCKERS & QUESTIONS FOR STAKEHOLDERS
+================================================================================
+
+1. OOS Selection Score Formula:
+   Question: Is "selection_score = subtrain_sharpe - penalty * val_sharpe" correct?
+   Or should it be a different blending (e.g., weighted average)?
+   
+   Impact: Affects which combos survive grid search; critical for generalization.
+   Blocker: TASK 1.2 cannot proceed without clarification.
+
+2. Turnover Penalty Lambda:
+   Question: What is the recommended starting point for turnover_penalty_lambda?
+   Is sensitivity analysis available (e.g., lambda sweep results)?
+   
+   Impact: Controls combo filtering; directly affects strategy turnover.
+   Blocker: TASK 3.1 needs tuning guidance.
+
+3. Cost-Aware Rebalancing Alpha Proxy:
+   Question: Should expected alpha be based on:
+   a) Recent strategy returns (current implementation hint)?
+   b) Factor-based alpha model (regression)?
+   c) Risk-adjusted returns (Sharpe)?
+   
+   Impact: Changes gate trigger frequency and portfolio turnover.
+   Blocker: TASK 1.3 needs design clarification.
+
+4. HMM State Labeling:
+   Question: How to determine which HMM state represents "bull" market?
+   Is it:
+   a) State with highest mean return?
+   b) State with highest volatility?
+   c) Pre-specified (e.g., State 2 of 3)?
+   
+   Impact: ML filtering direction (scale up in bull vs. scale down in bear).
+   Blocker: TASK 2.3 needs clarification.
+
+5. Multi-Asset Return Alignment:
+   Question: For assets with different trading calendars, should NaN be filled:
+   a) With 0 (current assumption: asset not traded)?
+   b) With forward-fill (assume held)?
+   c) With asset's own baseline (buy-and-hold)?
+   
+   Impact: Portfolio return computation; can introduce selection bias.
+   Blocker: TASK 2.2 needs assumption documentation.
+
+6. C++ Library Location:
+   Question: Where are grid_signals.cpp and hmm_regime.cpp stored?
+   Are they in the repo or expected from external source?
+   
+   Impact: Build reliability; affects src/tema/cpp/ structure.
+   Blocker: TASK 4.2 needs file paths.
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+PHASE 1 (Immediate):
+  1. Clarify design questions (see BLOCKERS section)
+  2. Audit actual source files in src/tema/ to verify cache artifacts
+  3. Prepare detailed extraction tickets for each PRIORITY 1 task
+
+PHASE 2 (Week 1):
+  1. Extract & implement PRIORITY 1 tasks (1.1–1.4)
+  2. Add unit tests for each module (especially grid validation, OOS selection)
+  3. Verify parity between monolith & modular code on test assets
+
+PHASE 3 (Week 2):
+  1. Extract & implement PRIORITY 2 tasks (2.1–2.5)
+  2. Integration tests: multi-asset pipeline end-to-end
+  3. Performance benchmarking: modular vs. monolith on real data
+
+PHASE 4 (Week 3+):
+  1. Extract PRIORITY 3 & 4 tasks
+  2. Documentation & deployment
+  3. Deprecate monolith; activate modular pipeline
+
+================================================================================
+CONCLUSION
+================================================================================
+
+The monolith TEMA-TEMPLATE(NEW_).py contains ~15 capability areas representing
+a mature portfolio optimization pipeline. The src/tema modular structure is
+well-architected but lacks actual source implementations (only cache artifacts).
+
+Critical gaps (MISSING):
+  • Out-of-sample combo selection (TASK 1.2)
+  • Cost-aware rebalancing gates (TASK 1.3)
+  • Asset-level pipeline orchestration (TASK 1.1)
+
+These three blockers must be extracted to unlock the full pipeline.
+
+Secondary gaps (PARTIAL) require verification and possible extension, particularly
+in ML scaling, diagnostics export, and parallel grid search orchestration.
+
+Risk is moderate but manageable with careful design and thorough testing of
+alpha proxy logic, NaN handling, and ML state labeling.
+
+Estimated effort: 3–4 weeks (design + implementation + testing).
+
