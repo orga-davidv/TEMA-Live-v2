@@ -37,6 +37,8 @@ def main():
     p.add_argument("--run-id", required=True)
     p.add_argument("--out-root", default="outputs")
     p.add_argument("--execute-legacy", action="store_true", help="If set, actually execute the legacy monolith (sets TEMA_RUN_LEGACY_EXECUTE=1)")
+    p.add_argument("--legacy-metrics-dataset", default=None, help="Legacy metrics dataset row (test/test_ml/train/train_ml)")
+    p.add_argument("--reproduce-template-ml", action="store_true", help="Shortcut: use legacy dataset test_ml and enable parity metrics bridge")
     p.add_argument("--fast", action="store_true", help="Pass conservative flags to modular pipeline to speed execution")
     p.add_argument("--modular-data-signals", action="store_true", help="Enable modular data/signals path")
     p.add_argument("--modular-portfolio", action="store_true", help="Enable modular portfolio allocator")
@@ -57,6 +59,9 @@ def main():
         help="Override modular performance metrics with latest legacy CSV metrics",
     )
     args = p.parse_args()
+    if args.reproduce_template_ml:
+        args.legacy_metrics_dataset = "test_ml"
+        args.parity_metrics_bridge = True
 
     run_id = args.run_id
     out_root = args.out_root
@@ -85,6 +90,8 @@ def main():
         "--portfolio-bl-tau", str(args.portfolio_bl_tau),
         "--portfolio-view-confidence", str(args.portfolio_view_confidence),
     ]
+    if args.legacy_metrics_dataset:
+        mod_args += ["--legacy-metrics-dataset", str(args.legacy_metrics_dataset)]
     if args.disable_full_universe_override:
         mod_args += ["--disable-full-universe-override"]
     if args.parity_metrics_bridge:
@@ -95,6 +102,8 @@ def main():
         env = os.environ.copy()
         env["TEMA_RUN_LEGACY_EXECUTE"] = "1"
         legacy_args = ["--run-id", legacy_id, "--legacy"]
+        if args.legacy_metrics_dataset:
+            legacy_args += ["--legacy-metrics-dataset", str(args.legacy_metrics_dataset)]
         rc_legacy = _run_pipeline(legacy_args, env=env)
         rc_mod = _run_pipeline(mod_args)
     else:

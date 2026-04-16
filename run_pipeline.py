@@ -101,7 +101,7 @@ def _apply_parity_metrics_bridge(run_result: dict, metrics_dataset: str, metrics
         json.dump(perf, fh, indent=2)
 
 
-def run_legacy(run_id: str, out_root: str = "outputs"):
+def run_legacy(run_id: str, out_root: str = "outputs", legacy_metrics_dataset: str | None = None):
     """Run the legacy monolith only when the env var TEMA_RUN_LEGACY_EXECUTE=1 is set.
 
     By default this function will create a best-effort manifest and NOT execute the
@@ -121,7 +121,7 @@ def run_legacy(run_id: str, out_root: str = "outputs"):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mf = out_dir / "manifest.json"
-    metrics_dataset = os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test")
+    metrics_dataset = legacy_metrics_dataset or os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test")
 
     def _write_manifest(extra: dict | None = None):
         payload = {"run_id": run_id}
@@ -172,6 +172,7 @@ def run_modular(
     ml_hmm_scalar_ceiling: float = 1.50,
     vol_target_apply_to_ml: bool = False,
     parity_metrics_bridge: bool = False,
+    parity_metrics_dataset: str | None = None,
 ):
     from tema.pipeline import run_pipeline as rp
     from tema.config import BacktestConfig
@@ -202,7 +203,7 @@ def run_modular(
     if bridge_enabled:
         _apply_parity_metrics_bridge(
             run_result=res,
-            metrics_dataset=os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test"),
+            metrics_dataset=parity_metrics_dataset or os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test"),
             metrics_csv_path=os.environ.get("TEMA_LEGACY_METRICS_PATH"),
         )
     return res
@@ -232,10 +233,11 @@ def main(argv=None):
     p.add_argument("--ml-hmm-scalar-ceiling", type=float, default=1.50)
     p.add_argument("--vol-target-apply-to-ml", action="store_true")
     p.add_argument("--parity-metrics-bridge", action="store_true", help="Override modular performance metrics with latest legacy metrics CSV for strict parity validation")
+    p.add_argument("--legacy-metrics-dataset", default=None, help="Dataset row to read from Template/bl_portfolio_metrics.csv (e.g. test, test_ml)")
     args = p.parse_args(argv)
 
     if args.legacy:
-        res = run_legacy(args.run_id)
+        res = run_legacy(args.run_id, legacy_metrics_dataset=args.legacy_metrics_dataset)
     else:
         res = run_modular(
             args.run_id,
@@ -259,6 +261,7 @@ def main(argv=None):
             ml_hmm_scalar_ceiling=args.ml_hmm_scalar_ceiling,
             vol_target_apply_to_ml=args.vol_target_apply_to_ml,
             parity_metrics_bridge=args.parity_metrics_bridge,
+            parity_metrics_dataset=args.legacy_metrics_dataset,
         )
     print(res)
     return res

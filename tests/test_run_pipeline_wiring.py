@@ -89,6 +89,32 @@ def test_run_legacy_writes_performance_manifest(tmp_path, monkeypatch):
     assert manifest["artifacts"] == ["performance"]
 
 
+def test_run_legacy_respects_explicit_legacy_metrics_dataset(tmp_path, monkeypatch):
+    fake_root = tmp_path / "repo"
+    template_dir = fake_root / "Template"
+    template_dir.mkdir(parents=True)
+    (template_dir / "TEMA-TEMPLATE(NEW_).py").write_text("print('ok')", encoding="utf-8")
+
+    def _fake_run_path(path, run_name=None, init_globals=None):
+        csv_data = (
+            "dataset,total_return,annualized_return,annualized_volatility,sharpe_ratio,max_drawdown\n"
+            "train,0,0.20,0.10,2.0,-0.10\n"
+            "test,0,0.12,0.08,1.5,-0.12\n"
+        )
+        (template_dir / "bl_portfolio_metrics.csv").write_text(csv_data, encoding="utf-8")
+        return {}
+
+    monkeypatch.setattr(run_pipeline, "ROOT", fake_root)
+    monkeypatch.setattr(run_pipeline.runpy, "run_path", _fake_run_path)
+    monkeypatch.setenv("TEMA_RUN_LEGACY_EXECUTE", "1")
+
+    out_root = tmp_path / "outputs"
+    res = run_pipeline.run_legacy(run_id="legacy-train", out_root=str(out_root), legacy_metrics_dataset="train")
+    perf = json.loads((Path(res["out_dir"]) / "performance.json").read_text(encoding="utf-8"))
+    assert perf["sharpe"] == 2.0
+    assert perf["annual_return"] == 0.20
+
+
 def test_run_modular_parity_metrics_bridge_overrides_performance(tmp_path, monkeypatch):
     fake_root = tmp_path / "repo"
     template_dir = fake_root / "Template"
@@ -119,7 +145,12 @@ def test_run_modular_parity_metrics_bridge_overrides_performance(tmp_path, monke
 
     monkeypatch.setattr(pipeline_mod, "run_pipeline", _fake_pipeline)
     out_root = tmp_path / "outputs"
-    res = run_pipeline.run_modular(run_id="mod-bridge", out_root=str(out_root), parity_metrics_bridge=True)
+    res = run_pipeline.run_modular(
+        run_id="mod-bridge",
+        out_root=str(out_root),
+        parity_metrics_bridge=True,
+        parity_metrics_dataset="test",
+    )
 
     perf = json.loads((Path(res["out_dir"]) / "performance.json").read_text(encoding="utf-8"))
     assert perf["sharpe"] == 1.5
@@ -161,7 +192,12 @@ def test_run_modular_parity_metrics_bridge_requires_complete_metrics(tmp_path, m
     monkeypatch.setattr(pipeline_mod, "run_pipeline", _fake_pipeline)
     out_root = tmp_path / "outputs"
     with pytest.raises(ValueError, match="sharpe"):
-        run_pipeline.run_modular(run_id="mod-bridge", out_root=str(out_root), parity_metrics_bridge=True)
+        run_pipeline.run_modular(
+            run_id="mod-bridge",
+            out_root=str(out_root),
+            parity_metrics_bridge=True,
+            parity_metrics_dataset="test",
+        )
 
 
 def test_run_modular_parity_metrics_bridge_requires_matching_dataset(tmp_path, monkeypatch):
@@ -195,4 +231,9 @@ def test_run_modular_parity_metrics_bridge_requires_matching_dataset(tmp_path, m
     monkeypatch.setattr(pipeline_mod, "run_pipeline", _fake_pipeline)
     out_root = tmp_path / "outputs"
     with pytest.raises(ValueError, match="dataset 'test' not found"):
-        run_pipeline.run_modular(run_id="mod-bridge", out_root=str(out_root), parity_metrics_bridge=True)
+        run_pipeline.run_modular(
+            run_id="mod-bridge",
+            out_root=str(out_root),
+            parity_metrics_bridge=True,
+            parity_metrics_dataset="test",
+        )
