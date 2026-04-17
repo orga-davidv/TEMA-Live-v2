@@ -916,6 +916,76 @@ def _ensemble_stage(
     return combined, info
 
 
+def _write_returns_csv(out_dir: str, *, index: pd.Index, values: Sequence[float], value_col: str, filename: str) -> str:
+    df = pd.DataFrame({"datetime": index.astype(str), value_col: np.asarray(values, dtype=float)})
+    path = os.path.join(out_dir, filename)
+    df.to_csv(path, index=False)
+    return path
+
+
+def _compute_backtest_periodic_returns(
+    *,
+    cfg: BacktestConfig,
+    final_weights: Sequence[float],
+    ctx: dict,
+) -> tuple[pd.Index, list[float], dict]:
+    price_df = ctx["price_df"]
+    train_df = ctx["train_df"]
+    test_df = ctx["test_df"]
+
+    strategy_returns_include_costs = False
+    if cfg.template_default_universe and isinstance(ctx.get("test_strategy_returns"), pd.DataFrame):
+        returns_df = (
+            ctx["test_strategy_returns"].replace([np.inf, -np.inf], np.nan).dropna(how="all").fillna(0.0)
+        )
+        returns_source = "strategy_test_returns"
+        strategy_returns_include_costs = bool(ctx.get("strategy_returns_include_costs", False))
+    else:
+        returns_df = test_df.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna(how="all").fillna(0.0)
+        returns_source = "buy_hold_pct_change"
+
+    if returns_df.empty:
+        raise ValueError("test returns panel is empty")
+
+    weights_path = _constant_weight_schedule(final_weights, len(returns_df))
+    if cfg.modular_data_signals_enabled and not getattr(cfg, "backtest_static_weights_in_template", False):
+        engine = resolve_signal_engine(use_cpp=cfg.signal_use_cpp, cpp_engine=None)
+        history_df = price_df.loc[: test_df.index[-1]]
+        signal_df = engine.generate(
+            price_df=history_df,
+            fast_period=cfg.signal_fast_period,
+            slow_period=cfg.signal_slow_period,
+            method=cfg.signal_method,
+        )
+        signal_df = signal_df.reindex(returns_df.index).fillna(0.0)
+        signal_weights = build_weight_schedule_from_signals(signal_df, fallback_weights=final_weights)
+        weights_path = _blend_signal_schedule_with_base_weights(signal_weights, base_weights=final_weights)
+        if len(weights_path) != len(returns_df):
+            raise ValueError("signal-derived weights shape mismatch")
+
+    sim_fee = 0.0 if strategy_returns_include_costs else cfg.fee_rate
+    sim_slippage = 0.0 if strategy_returns_include_costs else cfg.slippage_rate
+
+    sim = run_return_equity_simulation(
+        asset_returns=returns_df.to_numpy(dtype=float),
+        target_weights=weights_path,
+        fee_rate=sim_fee,
+        slippage_rate=sim_slippage,
+        freq=cfg.freq,
+    )
+
+    meta = {
+        "rows": int(len(returns_df)),
+        "train_rows": int(len(train_df)),
+        "test_rows": int(len(test_df)),
+        "assets": list(returns_df.columns),
+        "returns_source": returns_source,
+        "strategy_returns_include_costs": strategy_returns_include_costs,
+        "split_mode": ctx.get("split_mode", "global"),
+    }
+    return returns_df.index, list(sim.periodic_returns), meta
+
+
 def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = None, out_root: str = "outputs") -> dict:
     """Execute Wave 2 simplified pipeline and write artifacts under outputs/{run_id}/.
 
@@ -977,6 +1047,77 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
     # Stage 6: Backtest performance
     performance = _backtest_stage(cfg, final_weights, ml_effective_alphas, data_context=data_context)
 
+    # Optional: write return-series CSVs (parity + template ML overlay)
+    returns_csv_info: dict = {"baseline_written": False, "ml_written": False}
+    template_ml_overlay: dict = {"enabled": False}
+
+    ctx = data_context
+    if ctx is None and (cfg.modular_data_signals_enabled or cfg.template_default_universe):
+        try:
+            ctx = _load_data_context(cfg)
+        except Exception as exc:
+            returns_csv_info["context_error"] = str(exc)
+            ctx = None
+
+    if ctx is not None:
+        try:
+            idx, periodic, meta = _compute_backtest_periodic_returns(cfg=cfg, final_weights=final_weights, ctx=ctx)
+            baseline_path = _write_returns_csv(
+                out_dir,
+                index=idx,
+                values=periodic,
+                value_col="portfolio_return",
+                filename="portfolio_test_returns.csv",
+            )
+            returns_csv_info.update({"baseline_written": True, "baseline_path": baseline_path, "baseline_meta": meta})
+        except Exception as exc:
+            returns_csv_info["baseline_error"] = str(exc)
+
+        if bool(getattr(cfg, "ml_template_overlay_enabled", False)) and bool(cfg.template_default_universe):
+            try:
+                train_strategy_returns = ctx.get("train_strategy_returns")
+                test_strategy_returns = ctx.get("test_strategy_returns")
+                template_bl_weights = ctx.get("template_bl_weights")
+
+                if (
+                    isinstance(train_strategy_returns, pd.DataFrame)
+                    and isinstance(test_strategy_returns, pd.DataFrame)
+                    and isinstance(template_bl_weights, pd.Series)
+                    and (not template_bl_weights.empty)
+                ):
+                    from ..ml.template_overlay import compute_template_ml_overlay
+
+                    overlay = compute_template_ml_overlay(
+                        train_returns_df=train_strategy_returns,
+                        test_returns_df=test_strategy_returns,
+                        weights=template_bl_weights,
+                        cfg=cfg,
+                        include_series=True,
+                    )
+                    series = overlay.pop("series", None)
+                    template_ml_overlay = {"enabled": True, **overlay}
+
+                    if isinstance(series, dict) and isinstance(series.get("ml_test"), dict):
+                        ml_idx = pd.Index(series["ml_test"]["datetime"])
+                        ml_vals = series["ml_test"]["portfolio_return_ml"]
+                        ml_path = _write_returns_csv(
+                            out_dir,
+                            index=ml_idx,
+                            values=ml_vals,
+                            value_col="portfolio_return_ml",
+                            filename="portfolio_test_returns_ml.csv",
+                        )
+                        returns_csv_info.update({"ml_written": True, "ml_path": ml_path})
+                    else:
+                        returns_csv_info["ml_error"] = "missing_ml_test_series"
+                else:
+                    template_ml_overlay = {
+                        "enabled": False,
+                        "reason": "missing_template_bl_weights_or_strategy_returns",
+                    }
+            except Exception as exc:
+                template_ml_overlay = {"enabled": False, "error": str(exc)}
+
     # Stage 7: Reporting artifacts
     artifacts = {
         "current_weights": current,
@@ -989,6 +1130,8 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         "final_weights": final_weights,
         "ml_info": ml_info,
         "performance": performance,
+        "returns_csv_info": returns_csv_info,
+        "template_ml_overlay": template_ml_overlay,
     }
     if cfg.stress_enabled:
         artifacts["stress_scenarios"] = evaluate_stress_scenarios(

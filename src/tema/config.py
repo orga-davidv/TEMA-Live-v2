@@ -66,6 +66,21 @@ class BacktestConfig:
     ml_position_scalar_target_vol: float = 0.10
     ml_position_scalar_max: float = 50.0
 
+    # Template-like ML overlay (matches Template/TEMA-TEMPLATE(NEW_).py semantics)
+    # NOTE: This overlay is applied to portfolio return streams, not to per-asset weights.
+    ml_template_overlay_enabled: bool = False
+    hmm_n_states: int = 2
+    hmm_n_iter: int = 30
+    hmm_var_floor: float = 1e-8
+    hmm_trans_sticky: float = 0.92
+    rf_n_estimators: int = 400
+    rf_max_depth: int = 4
+    rf_min_samples_leaf: int = 20
+    rf_random_state: int = 42
+    ml_prob_threshold: float = 0.55
+    ml_auto_threshold: bool = True
+    ml_target_exposure: float = 0.10
+
     # Vol-target scaling controls
     vol_target_enabled: bool = True
     vol_target_annual: float = 0.10

@@ -8,12 +8,14 @@
 
 Template schreibt die Portfolio-Test-Returns in:
 - `Template/portfolio_test_returns.csv` (Spalte `portfolio_return`)
+- `Template/portfolio_test_returns_ml.csv` (Spalte `portfolio_return_ml`)
 
-Aus dieser CSV reproduziert man exakt die Benchmark:
+Aus diesen CSVs reproduziert man exakt die Benchmarks:
 
 | Quelle | Perioden | annual_return | annual_vol | Sharpe | max_drawdown |
 |---|---:|---:|---:|---:|---:|
 | **Template strategy portfolio test** (`Template/portfolio_test_returns.csv`) | 2028 | 0.103254 | 0.100500 | **1.027408** | -0.135089 |
+| **Template strategy portfolio test (ML overlay)** (`Template/portfolio_test_returns_ml.csv`) | 2028 | 0.108154 | 0.088728 | **1.218938** | -0.125063 |
 
 **Wichtig:** Die Template-Portfolio-Returns sind **Strategie-Returns** (TEMA/EMA-Strategie inkl. Pipeline-Logik), nicht einfach Markt-/Buy&Hold-Returns.
 
@@ -44,6 +46,29 @@ Resultat (aus `outputs_outroot_test/parity-template/performance.json`):
 | **src modular (parity mode)** | 2028 | 0.103254 | 0.100500 | **1.027408** | -0.135089 |
 
 ✅ **Parity erreicht** (Sharpe/Return/Vol/Periods matchen den Template-Benchmark innerhalb numerischer Rundungsfehler).
+
+### 2.1) Template-ML Overlay Parity (Sharpe ~1.2189)
+
+Reproduktion (modular/src, Template ist Benchmark):
+```bash
+python run_pipeline.py \
+  --run-id parity-template-ml \
+  --out-root outputs_outroot_test \
+  --template-default-universe \
+  --modular-data-signals \
+  --modular-portfolio \
+  --ml-template-overlay
+```
+
+- Output:
+  - `outputs_outroot_test/parity-template-ml/portfolio_test_returns.csv`
+  - `outputs_outroot_test/parity-template-ml/portfolio_test_returns_ml.csv`
+- Erwartung: `portfolio_test_returns_ml.csv` matcht `Template/portfolio_test_returns_ml.csv` innerhalb numerischer Rundungsfehler (typisch max abs diff ~1e-15) und reproduziert Sharpe **~1.218938**.
+
+Alternativ als Helper:
+```bash
+python scripts/ml/run_template_ml_overlay.py --run-id parity-template-ml --out-root outputs_outroot_test
+```
 
 > Historisch (vor dem Fix) lag die src-Pipeline in Template-Default-Universe Mode deutlich daneben (u.a. falscher Return-Stream / falsches Split-/Alignment) und kam nur auf ~1124 Perioden im Testfenster.
 
