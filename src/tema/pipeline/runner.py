@@ -55,8 +55,20 @@ def _try_load_template_artifacts(root: str) -> tuple[pd.DataFrame | None, pd.Ser
     if not (os.path.exists(summary_path) and os.path.exists(weights_path)):
         return None, None
 
-    summary_df = pd.read_csv(summary_path)
-    bl_weights = pd.read_csv(weights_path, index_col=0)["weight"].astype(float)
+    try:
+        summary_df = pd.read_csv(summary_path)
+        weights_df = pd.read_csv(weights_path, index_col=0)
+    except Exception:
+        return None, None
+
+    required_cols = {"asset", "ema1_period", "ema2_period", "ema3_period"}
+    if not required_cols.issubset(set(summary_df.columns)):
+        return None, None
+
+    if "weight" not in weights_df.columns:
+        return None, None
+
+    bl_weights = pd.to_numeric(weights_df["weight"], errors="coerce").astype(float)
     bl_weights.index = bl_weights.index.astype(str)
     bl_weights = bl_weights.replace([np.inf, -np.inf], np.nan).dropna()
     if summary_df.empty or bl_weights.empty:
