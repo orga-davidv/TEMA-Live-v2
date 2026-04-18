@@ -50,6 +50,7 @@ def test_pipeline_uses_modular_data_signals_when_enabled(tmp_path):
     final_weights = json.loads((Path(res["out_dir"]) / "final_weights.json").read_text(encoding="utf-8"))
 
     assert portfolio_info["enabled"] is True
+    assert "rebalance_gate" in portfolio_info
     assert portfolio_info["fallback_used"] is False
     assert portfolio_info["portfolio_modular_enabled"] is True
     assert portfolio_info["portfolio_method"] in {"black_litterman_like", "mean_variance", "mean_variance_fallback"}

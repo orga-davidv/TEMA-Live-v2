@@ -17,7 +17,7 @@ import csv
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from parity_compare import compare_runs  # type: ignore
+from parity_compare import compare_runs, evaluate_parity_thresholds, DEFAULT_PARITY_THRESHOLDS  # type: ignore
 
 
 def _run_pipeline(args_list, env=None):
@@ -58,6 +58,15 @@ def main():
         "--parity-metrics-bridge",
         action="store_true",
         help="Override modular performance metrics with latest legacy CSV metrics",
+    )
+    p.add_argument("--threshold-sharpe", type=float, default=DEFAULT_PARITY_THRESHOLDS["sharpe"])
+    p.add_argument("--threshold-annual-return", type=float, default=DEFAULT_PARITY_THRESHOLDS["annual_return"])
+    p.add_argument("--threshold-annual-volatility", type=float, default=DEFAULT_PARITY_THRESHOLDS["annual_volatility"])
+    p.add_argument("--threshold-max-drawdown", type=float, default=DEFAULT_PARITY_THRESHOLDS["max_drawdown"])
+    p.add_argument(
+        "--enforce-thresholds",
+        action="store_true",
+        help="Return non-zero exit code when parity thresholds fail",
     )
     args = p.parse_args()
     if args.reproduce_template_ml:
@@ -122,6 +131,16 @@ def main():
 
     # Compare
     comp = compare_runs(str(mod_manifest), str(legacy_manifest))
+    parity_gate = evaluate_parity_thresholds(
+        comp,
+        thresholds={
+            "sharpe": args.threshold_sharpe,
+            "annual_return": args.threshold_annual_return,
+            "annual_volatility": args.threshold_annual_volatility,
+            "max_drawdown": args.threshold_max_drawdown,
+        },
+    )
+    comp["parity_gate"] = parity_gate
 
     # ensure out dir
     out_dir = Path(out_root) / run_id
@@ -129,6 +148,7 @@ def main():
 
     json_path = out_dir / "parity_metrics_comparison.json"
     csv_path = out_dir / "parity_metrics_comparison.csv"
+    gate_path = out_dir / "parity_gate.json"
 
     with open(json_path, "w", encoding="utf-8") as fh:
         json.dump(comp, fh, indent=2)
@@ -144,12 +164,18 @@ def main():
         for r in rows:
             writer.writerow(r)
 
-    print("wrote:", json_path, csv_path)
+    with open(gate_path, "w", encoding="utf-8") as fh:
+        json.dump(parity_gate, fh, indent=2)
+
+    print("wrote:", json_path, csv_path, gate_path)
+    print("parity_gate_passed:", parity_gate.get("passed"))
     # exit code summarising
     if rc_mod != 0:
         return 2
     if args.execute_legacy and rc_legacy != 0:
         return 3
+    if args.enforce_thresholds and not bool(parity_gate.get("passed")):
+        return 4
     return 0
 
 

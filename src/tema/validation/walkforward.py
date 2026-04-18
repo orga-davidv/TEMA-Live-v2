@@ -71,6 +71,7 @@ def compute_window_metrics(
     returns: pd.Series,
     windows: List[Dict],
     annualization_factor: float = 252.0,
+    risk_free_rate: float = 0.0,
 ) -> pd.DataFrame:
     """Compute per-window metrics for the test portions of windows.
 
@@ -93,7 +94,13 @@ def compute_window_metrics(
         else:
             eq = _build_equity(r)
             to = np.zeros_like(r)
-            m = compute_backtest_metrics(r, eq, to, annualization_factor)
+            m = compute_backtest_metrics(
+                r,
+                eq,
+                to,
+                annualization_factor,
+                risk_free_rate=float(risk_free_rate),
+            )
             metrics = {
                 "sharpe": float(m.get("sharpe", float("nan"))),
                 "annual_return": float(m.get("annual_return", float("nan"))),
@@ -147,11 +154,17 @@ def run_walkforward_on_series(
     test_months: int = 6,
     step_months: int = 3,
     annualization_factor: float = 252.0,
+    risk_free_rate: float = 0.0,
     sharpe_threshold: float = 0.5,
 ):
     dates = returns.index
     windows = generate_walkforward_windows(dates, train_years=train_years, test_months=test_months, step_months=step_months)
-    per_df = compute_window_metrics(returns, windows, annualization_factor=annualization_factor)
+    per_df = compute_window_metrics(
+        returns,
+        windows,
+        annualization_factor=annualization_factor,
+        risk_free_rate=risk_free_rate,
+    )
     summary = summarize_metrics(per_df, sharpe_threshold=sharpe_threshold)
     return windows, per_df, summary
 

@@ -1,6 +1,85 @@
 import json
 import os
+import re
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Tuple
+
+MANIFEST_SCHEMA_VERSION = "manifest.v1"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def load_manifest_schema(schema_version: str = MANIFEST_SCHEMA_VERSION) -> Dict:
+    schema_path = _repo_root() / "schemas" / f"{schema_version}.json"
+    with open(schema_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _validate_json_schema(instance, schema: Dict, path: str, errors: List[str]) -> None:
+    expected_type = schema.get("type")
+    if expected_type == "object":
+        if not isinstance(instance, dict):
+            errors.append(f"{path}: expected object")
+            return
+        required = schema.get("required", [])
+        for key in required:
+            if key not in instance:
+                errors.append(f"{path}.{key}: missing required property")
+        properties = schema.get("properties", {})
+        for key, value in instance.items():
+            if key in properties:
+                _validate_json_schema(value, properties[key], f"{path}.{key}", errors)
+    elif expected_type == "array":
+        if not isinstance(instance, list):
+            errors.append(f"{path}: expected array")
+            return
+        if schema.get("uniqueItems", False):
+            seen = set()
+            for idx, item in enumerate(instance):
+                marker = json.dumps(item, sort_keys=True)
+                if marker in seen:
+                    errors.append(f"{path}[{idx}]: duplicate item")
+                seen.add(marker)
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for idx, item in enumerate(instance):
+                _validate_json_schema(item, item_schema, f"{path}[{idx}]", errors)
+    elif expected_type == "string":
+        if not isinstance(instance, str):
+            errors.append(f"{path}: expected string")
+            return
+        pattern = schema.get("pattern")
+        if isinstance(pattern, str) and re.match(pattern, instance) is None:
+            errors.append(f"{path}: does not match pattern {pattern}")
+        if schema.get("format") == "date-time":
+            try:
+                datetime.fromisoformat(instance.replace("Z", "+00:00"))
+            except ValueError:
+                errors.append(f"{path}: invalid date-time")
+    elif expected_type == "boolean":
+        if not isinstance(instance, bool):
+            errors.append(f"{path}: expected boolean")
+    elif expected_type == "number":
+        if not isinstance(instance, (int, float)) or isinstance(instance, bool):
+            errors.append(f"{path}: expected number")
+    elif expected_type == "integer":
+        if not isinstance(instance, int) or isinstance(instance, bool):
+            errors.append(f"{path}: expected integer")
+
+    if "const" in schema and instance != schema["const"]:
+        errors.append(f"{path}: expected constant value {schema['const']}")
+    if "enum" in schema and instance not in schema["enum"]:
+        errors.append(f"{path}: expected one of {schema['enum']}")
+
+
+def validate_manifest_schema(manifest: Dict, schema: Dict | None = None) -> Tuple[bool, List[str]]:
+    schema_obj = schema or load_manifest_schema()
+    errors: List[str] = []
+    _validate_json_schema(manifest, schema_obj, "$", errors)
+    return (len(errors) == 0, errors)
 
 
 def load_manifest(path: str) -> Dict:
@@ -47,7 +126,7 @@ def compare_manifests(mod_manifest_path: str, legacy_manifest_path: str) -> Dict
     leg = load_manifest(legacy_manifest_path)
 
     # 1) Modular manifest required keys
-    req_keys = ["run_id", "timestamp", "artifacts"]
+    req_keys = ["schema_version", "run_id", "timestamp", "artifacts"]
     ok_keys, missing = check_manifest_keys(mod, req_keys)
     report["results"]["manifest_keys"] = {"ok": ok_keys, "missing": missing}
 

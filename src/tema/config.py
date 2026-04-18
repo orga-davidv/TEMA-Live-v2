@@ -30,6 +30,8 @@ class BacktestConfig:
     template_grid_mid_periods: tuple[int, ...] = (8, 13)
     template_grid_long_periods: tuple[int, ...] = (21, 34)
     template_grid_require_strict_order: bool = True
+    template_grid_min_gap: int = 0
+    template_grid_signal_logic: str = "hierarchical"
     template_grid_validation_ratio: float = 0.25
     template_grid_validation_min_rows: int = 20
     template_grid_validation_shortlist: Optional[int] = 20
@@ -115,6 +117,7 @@ class BacktestConfig:
     dd_guard_enabled: bool = False
     dd_guard_max_drawdown: float = 0.10
     dd_guard_floor: float = 0.25
+    dd_guard_allow_full_derisk: bool = True
     dd_guard_recovery_halflife: int = 20
 
     # Dynamic ensemble controls (Phase 1)
@@ -146,6 +149,7 @@ class BacktestConfig:
 
     # Generic
     freq: str = "D"
+    risk_free_rate: float = 0.0
 
     # Monitoring / run ledger
     monitoring_ledger_enabled: bool = False

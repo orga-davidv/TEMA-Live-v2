@@ -19,11 +19,18 @@ def compute_drawdown_series(equity_curve: pd.Series) -> pd.Series:
     return dd
 
 
-def compute_dd_guard_scalar(drawdown: pd.Series, *, max_dd: float, floor: float, recovery_halflife: int = 20) -> pd.Series:
-    """Compute a drawdown-guard scalar series in [floor, 1.0].
+def compute_dd_guard_scalar(
+    drawdown: pd.Series,
+    *,
+    max_dd: float,
+    floor: float,
+    recovery_halflife: int = 20,
+    allow_full_derisk: bool = False,
+) -> pd.Series:
+    """Compute a drawdown-guard scalar series.
 
     - When drawdown > -max_dd, target is 1.0
-    - When drawdown <= -max_dd, target is `floor`
+    - When drawdown <= -max_dd, target is `floor` (or 0.0 if allow_full_derisk=True)
     - Scalar moves toward target via exponential smoothing with a half-life.
 
     Half-life semantics: after `recovery_halflife` periods the distance to the target is halved.
@@ -31,16 +38,18 @@ def compute_dd_guard_scalar(drawdown: pd.Series, *, max_dd: float, floor: float,
     if drawdown is None or drawdown.size == 0:
         return pd.Series(dtype=float)
     dd = pd.to_numeric(drawdown, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    floor_value = float(floor)
+    min_scalar = 0.0 if bool(allow_full_derisk) else floor_value
     # smoothing factor per period derived from half-life
     halflife = max(1, int(recovery_halflife))
     alpha = 1.0 - (0.5 ** (1.0 / float(halflife)))
     out = []
     prev = 1.0
     for v in dd.to_numpy(dtype=float):
-        target = 1.0 if v > -abs(float(max_dd)) else float(floor)
+        target = 1.0 if v > -abs(float(max_dd)) else min_scalar
         curr = prev * (1.0 - alpha) + target * alpha
         # clamp
-        curr = min(max(curr, float(floor)), 1.0)
+        curr = min(max(curr, min_scalar), 1.0)
         out.append(curr)
         prev = curr
     return pd.Series(out, index=dd.index)

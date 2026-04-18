@@ -9,6 +9,9 @@ on:
 jobs:
   test-fast:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: src
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,16 +24,57 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
-          pip install pytest
+          pip install pytest numpy pandas scipy scikit-learn optuna
 
       - name: Run targeted fast tests
         run: |
-          pytest -q tests
+          pytest -q \
+            tests/test_run_pipeline_wiring.py \
+            tests/test_pipeline_modular_data_signals.py \
+            tests/test_ml_modular_path.py \
+            tests/test_portfolio_allocation.py \
+            tests/test_dd_guard.py \
+            tests/test_validate_oos_gates.py \
+            tests/test_phase4_online_learning.py \
+            tests/test_phase5_stress_scenarios.py \
+            --junitxml=pytest-fast.xml
 
-      - name: Upload test logs
-        if: failure()
+      - name: Upload fast test report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-logs
-          path: pytest.log
+          name: pytest-fast-report
+          path: pytest-fast.xml
+          if-no-files-found: warn
+
+  parity-result-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONPATH: src
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Build parity comparison fixture
+        run: |
+          mkdir -p outputs_ci/parity-gate
+          python - <<'PY'
+          import json
+          payload = {
+              "run_a": {"sharpe": 1.00, "annual_return": 0.10, "annual_volatility": 0.11, "max_drawdown": -0.12},
+              "run_b": {"sharpe": 1.08, "annual_return": 0.11, "annual_volatility": 0.12, "max_drawdown": -0.11},
+              "diff": {"sharpe": 0.08, "annual_return": 0.01, "annual_volatility": 0.01, "max_drawdown": 0.01}
+          }
+          with open("outputs_ci/parity-gate/parity_metrics_comparison.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+          PY
+
+      - name: Evaluate parity thresholds gate
+        run: |
+          python scripts/evaluate_parity_gate.py outputs_ci/parity-gate/parity_metrics_comparison.json

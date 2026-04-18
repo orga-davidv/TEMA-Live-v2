@@ -1,6 +1,6 @@
 import pandas as pd
 
-from tema.data import split_panel_per_asset
+from tema.data import split_panel_per_asset, split_grid_subtrain_validation
 
 
 def test_split_panel_per_asset_basic():
@@ -38,3 +38,27 @@ def test_split_panel_per_asset_short_and_empty():
     # d has no valid rows -> both partitions empty (column present but all NaN)
     assert train_df['d'].dropna().empty
     assert test_df['d'].dropna().empty
+
+
+def test_split_grid_subtrain_validation_preserves_order_and_bounds():
+    s = pd.Series(range(10), dtype=float)
+    subtrain, val, split_idx = split_grid_subtrain_validation(
+        s,
+        validation_ratio=0.3,
+        validation_min_rows=2,
+    )
+    assert split_idx == 7
+    assert subtrain.tolist() == list(range(7))
+    assert val.tolist() == list(range(7, 10))
+
+
+def test_split_grid_subtrain_validation_clamps_small_windows():
+    s = pd.Series(range(5), dtype=float)
+    subtrain, val, split_idx = split_grid_subtrain_validation(
+        s,
+        validation_ratio=0.9,
+        validation_min_rows=3,
+    )
+    assert split_idx == 1
+    assert len(subtrain) == 1
+    assert len(val) == 4

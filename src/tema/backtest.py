@@ -64,6 +64,7 @@ def run_return_equity_simulation(
     impact_coeff: float = 0.0,
     borrow_bps: float = 0.0,
     freq: str = "D",
+    risk_free_rate: float = 0.0,
 ) -> BacktestResult:
     ret = np.asarray(asset_returns, dtype=float)
     w = np.asarray(target_weights, dtype=float)
@@ -73,7 +74,13 @@ def run_return_equity_simulation(
         raise ValueError("asset_returns and target_weights must have identical shapes")
     if ret.shape[0] == 0:
         ann = _annualization_factor(freq)
-        metrics = compute_backtest_metrics(np.array([], dtype=float), np.array([], dtype=float), np.array([], dtype=float), ann)
+        metrics = compute_backtest_metrics(
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+            ann,
+            risk_free_rate=risk_free_rate,
+        )
         return BacktestResult([], [], [], ann, metrics)
 
     # Walk-forward-friendly execution: apply previous target weights to current period return.
@@ -104,7 +111,13 @@ def run_return_equity_simulation(
         prev = cur
     equity = np.cumprod(1.0 + periodic_returns)
     ann = _annualization_factor(freq)
-    metrics = compute_backtest_metrics(periodic_returns, equity, turnover_series, ann)
+    metrics = compute_backtest_metrics(
+        periodic_returns,
+        equity,
+        turnover_series,
+        ann,
+        risk_free_rate=risk_free_rate,
+    )
     return BacktestResult(
         periodic_returns=periodic_returns.tolist(),
         equity_curve=equity.tolist(),
@@ -119,6 +132,7 @@ def compute_backtest_metrics(
     equity_curve: np.ndarray,
     turnover_series: np.ndarray,
     annualization_factor: float,
+    risk_free_rate: float = 0.0,
 ) -> dict:
     r = np.asarray(periodic_returns, dtype=float)
     e = np.asarray(equity_curve, dtype=float)
@@ -139,7 +153,7 @@ def compute_backtest_metrics(
     gross = float(np.prod(1.0 + r))
     annual_return = float(gross ** (annualization_factor / len(r)) - 1.0) if gross > 0 else -1.0
     # Template semantics: Sharpe = annual_return / annual_vol (safe zero-vol guard)
-    sharpe = 0.0 if annual_vol <= 1e-12 else float(annual_return) / float(annual_vol)
+    sharpe = 0.0 if annual_vol <= 1e-12 else (float(annual_return) - float(risk_free_rate)) / float(annual_vol)
     if e.size == 0:
         max_drawdown = 0.0
     else:

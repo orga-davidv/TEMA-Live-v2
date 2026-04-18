@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tema-live-v2/schemas/manifest.v1.json",
+  "title": "TEMA run manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "timestamp",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "manifest.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "legacy_executed": {
+      "type": "boolean"
+    },
+    "note": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

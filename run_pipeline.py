@@ -23,6 +23,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent
 # Ensure src is on sys.path so "tema" package can be imported
 sys.path.insert(0, str(ROOT / "src"))
+from tema.validation.manifest import MANIFEST_SCHEMA_VERSION
 
 
 def _extract_legacy_performance(
@@ -402,11 +403,10 @@ def run_legacy(run_id: str, out_root: str = "outputs", legacy_metrics_dataset: s
     legacy script. This keeps the CLI safe and deterministic for CI/tests while still
     providing an explicit opt-in to run the old monolith.
     """
-    legacy_path = ROOT / "Template" / "TEMA-TEMPLATE(NEW_).py"
-    if not legacy_path.exists():
-        raise FileNotFoundError(f"Legacy monolith not found: {legacy_path}")
-
     should_exec = os.environ.get("TEMA_RUN_LEGACY_EXECUTE", "0") == "1"
+    legacy_path = ROOT / "Template" / "TEMA-TEMPLATE(NEW_).py"
+    if should_exec and not legacy_path.exists():
+        raise FileNotFoundError(f"Legacy monolith not found: {legacy_path}")
     # sanitize run_id to avoid path traversal
     if not re.match(r'^[A-Za-z0-9._-]+$', run_id):
         raise ValueError("Invalid run_id; only A-Za-z0-9._- allowed")
@@ -416,9 +416,15 @@ def run_legacy(run_id: str, out_root: str = "outputs", legacy_metrics_dataset: s
 
     mf = out_dir / "manifest.json"
     metrics_dataset = legacy_metrics_dataset or os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test")
+    timestamp = pd.Timestamp.utcnow().isoformat().replace("+00:00", "Z")
 
     def _write_manifest(extra: dict | None = None):
-        payload = {"run_id": run_id}
+        payload = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "run_id": run_id,
+            "timestamp": timestamp,
+            "artifacts": [],
+        }
         if extra:
             payload.update(extra)
         with open(mf, 'w', encoding='utf-8') as fh:

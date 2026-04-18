@@ -52,7 +52,7 @@ def test_parity_helper_smoke(tmp_path):
     a_dir.mkdir()
     b_dir.mkdir()
 
-    a_manifest = {"run_id": "a1", "timestamp": "t", "artifacts": ["x"]}
+    a_manifest = {"schema_version": "manifest.v1", "run_id": "a1", "timestamp": "t", "artifacts": ["x"]}
     b_manifest = {"run_id": "a1", "legacy_executed": False}
 
     a_path = a_dir / "manifest.json"

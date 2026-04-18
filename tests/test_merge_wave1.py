@@ -1,4 +1,5 @@
 from tema import BacktestConfig, Runner
+from tema.turnover import apply_rebalance_gating_with_diagnostics
 
 
 def test_should_respect_min_threshold():
@@ -41,3 +42,22 @@ def test_ml_and_vol_flags_present():
     r = Runner(cfg)
     flags = r.ml_and_vol_flags()
     assert "ml_enabled" in flags and "vol_target_enabled" in flags
+
+
+def test_rebalance_gate_diagnostics_include_cost_blocks():
+    cfg = BacktestConfig(
+        rebalance_min_threshold=0.0001,
+        cost_aware_rebalance=True,
+        cost_aware_rebalance_multiplier=1.0,
+        fee_rate=0.001,
+        slippage_rate=0.001,
+    )
+    gated, diag = apply_rebalance_gating_with_diagnostics(
+        current_weights=[0.0, 0.0],
+        candidate_weights=[0.5, 0.005],
+        expected_alphas=[0.0001, 0.1],
+        cfg=cfg,
+    )
+    assert gated == [0.0, 0.005]
+    assert diag["cost_block_count"] == 1
+    assert diag["threshold_block_count"] == 0

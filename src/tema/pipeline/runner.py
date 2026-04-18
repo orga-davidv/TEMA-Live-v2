@@ -1,6 +1,6 @@
 from typing import List, Sequence, Optional
 from ..config import BacktestConfig
-from ..turnover import apply_rebalance_gating
+from ..turnover import apply_rebalance_gating_with_diagnostics
 from ..ensemble import DynamicEnsembleConfig, combine_stream_signals, compute_dynamic_ensemble_weights
 from ..online_learning import OnlineLogisticLearner
 from ..stress import evaluate_stress_scenarios
@@ -20,6 +20,7 @@ from ..ml import (
     score_rf_probabilities,
     threshold_probabilities,
 )
+from ..validation.manifest import MANIFEST_SCHEMA_VERSION
 from ..risk import dd_guard
 import json
 import os
@@ -186,12 +187,15 @@ def _build_template_grid_combos(cfg: BacktestConfig) -> list[tuple[int, int, int
     short_periods = _coerce_unique_positive_periods(cfg.template_grid_short_periods)
     mid_periods = _coerce_unique_positive_periods(cfg.template_grid_mid_periods)
     long_periods = _coerce_unique_positive_periods(cfg.template_grid_long_periods)
+    min_gap = max(0, int(getattr(cfg, "template_grid_min_gap", 0)))
     combos: list[tuple[int, int, int]] = []
     for p1 in short_periods:
         for p2 in mid_periods:
             for p3 in long_periods:
                 if bool(cfg.template_grid_require_strict_order):
                     if not (p1 < p2 < p3):
+                        continue
+                    if min_gap > 0 and ((p2 - p1) < min_gap or (p3 - p2) < min_gap):
                         continue
                 elif len({p1, p2, p3}) < 3:
                     continue
@@ -223,11 +227,17 @@ def _annualized_expected_alphas_from_strategy_train_returns(train_strategy_retur
     return pd.Series(out, dtype=float)
 
 
-def _compute_overlay_test_metrics(returns: pd.Series, *, freq: str) -> dict:
+def _compute_overlay_test_metrics(returns: pd.Series, *, freq: str, risk_free_rate: float = 0.0) -> dict:
     clean = pd.to_numeric(returns, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
     arr = clean.to_numpy(dtype=float)
     eq = np.cumprod(1.0 + arr)
-    metrics = compute_backtest_metrics(arr, eq, np.zeros_like(arr), _annualization_factor(freq))
+    metrics = compute_backtest_metrics(
+        arr,
+        eq,
+        np.zeros_like(arr),
+        _annualization_factor(freq),
+        risk_free_rate=risk_free_rate,
+    )
     metrics["equity_final"] = float(eq[-1]) if eq.size else 1.0
     metrics["total_return"] = float(eq[-1] - 1.0) if eq.size else 0.0
     return metrics
@@ -366,6 +376,7 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
                         fee_rate=strategy_fee,
                         slippage_rate=strategy_slippage,
                         shift_by=int(cfg.template_grid_shift_by),
+                        signal_logic_mode="or",
                     ).astype(float)
                     test_rets_dict[asset] = build_strategy_returns_for_triple_ema_combo(
                         test_close,
@@ -373,6 +384,7 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
                         fee_rate=strategy_fee,
                         slippage_rate=strategy_slippage,
                         shift_by=int(cfg.template_grid_shift_by),
+                        signal_logic_mode="or",
                     ).astype(float)
 
                     strategy_combo_selection.append(
@@ -407,6 +419,7 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
                     "weights_source": "precomputed_parity_artifacts",
                     "combo_source": "precomputed_parity_artifacts",
                     "shift_by": int(cfg.template_grid_shift_by),
+                    "signal_logic_mode": "or",
                 }
 
                 ctx = {
@@ -470,6 +483,10 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
             slippage_rate=strategy_slippage,
             shift_by=cfg.template_grid_shift_by,
             annualization=_annualization_factor(cfg.freq),
+            require_strict_order=bool(cfg.template_grid_require_strict_order),
+            min_gap=int(getattr(cfg, "template_grid_min_gap", 0)),
+            signal_logic_mode=str(getattr(cfg, "template_grid_signal_logic", "hierarchical")),
+            risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
         )
         train_strategy_returns = train_strategy_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         test_strategy_returns = test_strategy_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -485,6 +502,8 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
             ),
             "overfit_penalty": float(cfg.template_grid_overfit_penalty),
             "shift_by": int(cfg.template_grid_shift_by),
+            "min_gap": int(getattr(cfg, "template_grid_min_gap", 0)),
+            "signal_logic_mode": str(getattr(cfg, "template_grid_signal_logic", "hierarchical")),
             "combos": [list(c) for c in template_grid_combos],
         }
     else:
@@ -673,6 +692,7 @@ def _backtest_stage(
             impact_coeff=cfg.impact_coeff,
             borrow_bps=cfg.borrow_bps,
             freq=cfg.freq,
+            risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
         )
         return {
             **sim.metrics,
@@ -707,6 +727,7 @@ def _backtest_stage(
             impact_coeff=cfg.impact_coeff,
             borrow_bps=cfg.borrow_bps,
             freq=cfg.freq,
+            risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
         )
         return {
             **sim.metrics,
@@ -1158,6 +1179,7 @@ def _compute_backtest_periodic_returns(
         fee_rate=sim_fee,
         slippage_rate=sim_slippage,
         freq=cfg.freq,
+        risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
     )
 
     meta = {
@@ -1240,7 +1262,9 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
     ml_effective_alphas = [a * s for a, s in zip(ensemble_alphas, ml_scalar)]
 
     # Stage 4: Turnover / cost gate
-    gated = apply_rebalance_gating(current, candidate, ml_effective_alphas, cfg)
+    gated, rebalance_gate_info = apply_rebalance_gating_with_diagnostics(current, candidate, ml_effective_alphas, cfg)
+    if isinstance(portfolio_info, dict):
+        portfolio_info["rebalance_gate"] = rebalance_gate_info
 
     # Stage 5: Scaling stage
     final_weights = _scaling_stage(gated, ml_info, cfg, train_returns_window=train_returns_window)
@@ -1252,6 +1276,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         "applied": False,
         "max_drawdown": float(getattr(cfg, "dd_guard_max_drawdown", 0.10)),
         "floor": float(getattr(cfg, "dd_guard_floor", 0.25)),
+        "allow_full_derisk": bool(getattr(cfg, "dd_guard_allow_full_derisk", True)),
         "recovery_halflife": int(getattr(cfg, "dd_guard_recovery_halflife", 20)),
         "history_scalar_last": 1.0,
     }
@@ -1283,6 +1308,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                     max_dd=float(cfg.dd_guard_max_drawdown),
                     floor=float(cfg.dd_guard_floor),
                     recovery_halflife=int(cfg.dd_guard_recovery_halflife),
+                    allow_full_derisk=bool(getattr(cfg, "dd_guard_allow_full_derisk", True)),
                 )
                 if len(hist_scalar) > 0:
                     last_scalar = float(hist_scalar.iloc[-1])
@@ -1343,6 +1369,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                 impact_coeff=cfg.impact_coeff,
                 borrow_bps=cfg.borrow_bps,
                 freq=cfg.freq,
+                risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
             )
             performance = {
                 **sim.metrics,
@@ -1494,8 +1521,20 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                 ann = _annualization_factor(cfg.freq)
                                 spec = RegimeBinSpec()
 
-                                base_df = compute_regime_report(returns=base_r, regime_prob=prob, annualization_factor=ann, spec=spec)
-                                ml_df = compute_regime_report(returns=ml_r, regime_prob=prob, annualization_factor=ann, spec=spec)
+                                base_df = compute_regime_report(
+                                    returns=base_r,
+                                    regime_prob=prob,
+                                    annualization_factor=ann,
+                                    risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
+                                    spec=spec,
+                                )
+                                ml_df = compute_regime_report(
+                                    returns=ml_r,
+                                    regime_prob=prob,
+                                    annualization_factor=ann,
+                                    risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
+                                    spec=spec,
+                                )
 
                                 base_path = os.path.join(out_dir, "regime_report_base_test.csv")
                                 ml_path = os.path.join(out_dir, "regime_report_ml_test.csv")
@@ -1546,6 +1585,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                             index=pd.to_datetime(bench_test_df["datetime"], utc=True),
                                         ),
                                         freq=cfg.freq,
+                                        risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
                                     )
                                     template_ml_meta_overlay = {
                                         "enabled": True,
@@ -1668,7 +1708,11 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                             "ml_meta_source": "computed",
                                         }
                                     )
-                                    meta_test_metrics = _compute_overlay_test_metrics(meta_test, freq=cfg.freq)
+                                    meta_test_metrics = _compute_overlay_test_metrics(
+                                        meta_test,
+                                        freq=cfg.freq,
+                                        risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
+                                    )
                                     template_ml_meta_overlay = {
                                         "enabled": True,
                                         "source": "computed",
@@ -1725,6 +1769,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         )
 
     manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "run_id": run_id,
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "artifacts": list(artifacts.keys()),

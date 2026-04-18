@@ -8,6 +8,13 @@ import json
 import os
 from typing import Dict, Any, Optional
 
+DEFAULT_PARITY_THRESHOLDS: Dict[str, float] = {
+    "sharpe": 0.20,
+    "annual_return": 0.03,
+    "annual_volatility": 0.03,
+    "max_drawdown": 0.03,
+}
+
 
 def _load_json(path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as fh:
@@ -103,3 +110,47 @@ def compare_runs(manifest_path_a: str, manifest_path_b: str) -> Dict[str, Any]:
             diff[k] = vb - va
 
     return {"run_a": a, "run_b": b, "diff": diff}
+
+
+def evaluate_parity_thresholds(
+    comparison: Dict[str, Any],
+    thresholds: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """Evaluate absolute metric diffs against explicit parity thresholds."""
+    thr = dict(DEFAULT_PARITY_THRESHOLDS)
+    if thresholds:
+        for k, v in thresholds.items():
+            if k in thr and v is not None:
+                thr[k] = float(v)
+
+    diff = comparison.get("diff", {}) if isinstance(comparison, dict) else {}
+    checks: Dict[str, Any] = {}
+    passed = True
+    for metric, limit in thr.items():
+        raw = diff.get(metric)
+        if raw is None:
+            checks[metric] = {
+                "ok": False,
+                "reason": "missing_diff",
+                "threshold": float(limit),
+                "diff": None,
+                "abs_diff": None,
+            }
+            passed = False
+            continue
+        abs_diff = abs(float(raw))
+        ok = abs_diff <= float(limit)
+        checks[metric] = {
+            "ok": bool(ok),
+            "threshold": float(limit),
+            "diff": float(raw),
+            "abs_diff": float(abs_diff),
+        }
+        if not ok:
+            passed = False
+
+    return {
+        "passed": bool(passed),
+        "thresholds": thr,
+        "checks": checks,
+    }

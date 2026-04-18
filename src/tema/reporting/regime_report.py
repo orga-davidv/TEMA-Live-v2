@@ -30,6 +30,7 @@ def compute_regime_report(
     returns: pd.Series,
     regime_prob: pd.Series,
     annualization_factor: float = 252.0,
+    risk_free_rate: float = 0.0,
     spec: RegimeBinSpec = RegimeBinSpec(),
 ) -> pd.DataFrame:
     """Compute performance metrics by regime buckets.
@@ -72,7 +73,13 @@ def compute_regime_report(
     for regime, sub in joined.groupby("regime", dropna=False):
         rr = sub["returns"].to_numpy(dtype=float)
         eq = np.cumprod(1.0 + rr) if rr.size else np.array([])
-        m = compute_backtest_metrics(rr, eq, np.zeros_like(rr), float(annualization_factor))
+        m = compute_backtest_metrics(
+            rr,
+            eq,
+            np.zeros_like(rr),
+            float(annualization_factor),
+            risk_free_rate=float(risk_free_rate),
+        )
         rows.append(
             {
                 "regime": str(regime),

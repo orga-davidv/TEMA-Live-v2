@@ -27,14 +27,20 @@ def generate_triple_ema_entry_exit_signals(
     combo: Tuple[int, int, int],
     *,
     shift_by: int = 1,
+    logic_mode: str = "hierarchical",
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Generate long-only entry/exit events from a triple-EMA combo.
 
-    Semantics match Template/TEMA-TEMPLATE(NEW_).py:
-      entries_raw = crossed_above(s1,s2) OR crossed_above(s1,s3) OR crossed_above(s2,s3)
-      exits_raw   = crossed_below(s1,s2) OR crossed_below(s1,s3) OR crossed_below(s2,s3)
-      then both are shifted by `shift_by` bars before execution.
+    logic_mode semantics:
+      - "hierarchical" (default): require strict EMA stack transitions
+          entry: (ema1 > ema2 > ema3) transitions from False -> True
+          exit : (ema1 < ema2 < ema3) transitions from False -> True
+      - "or": legacy Template-like OR crossover behavior
+          entry: crossed_above(s1,s2) OR crossed_above(s1,s3) OR crossed_above(s2,s3)
+          exit : crossed_below(s1,s2) OR crossed_below(s1,s3) OR crossed_below(s2,s3)
+
+    Both entry/exit streams are shifted by `shift_by` bars before execution.
     """
     if not isinstance(close, pd.Series):
         raise ValueError("close must be a pandas Series")
@@ -42,14 +48,22 @@ def generate_triple_ema_entry_exit_signals(
         raise ValueError("combo must contain exactly three EMA periods")
     if shift_by < 0:
         raise ValueError("shift_by must be >= 0")
+    if logic_mode not in {"hierarchical", "or"}:
+        raise ValueError("logic_mode must be one of {'hierarchical', 'or'}")
 
     e1, e2, e3 = (int(combo[0]), int(combo[1]), int(combo[2]))
     s1 = _ema_series(close, e1)
     s2 = _ema_series(close, e2)
     s3 = _ema_series(close, e3)
 
-    entries_raw = _crossed_above(s1, s2) | _crossed_above(s1, s3) | _crossed_above(s2, s3)
-    exits_raw = _crossed_below(s1, s2) | _crossed_below(s1, s3) | _crossed_below(s2, s3)
+    if logic_mode == "or":
+        entries_raw = _crossed_above(s1, s2) | _crossed_above(s1, s3) | _crossed_above(s2, s3)
+        exits_raw = _crossed_below(s1, s2) | _crossed_below(s1, s3) | _crossed_below(s2, s3)
+    else:
+        bullish_stack = (s1 > s2) & (s2 > s3)
+        bearish_stack = (s1 < s2) & (s2 < s3)
+        entries_raw = bullish_stack & (~bullish_stack.shift(1, fill_value=False))
+        exits_raw = bearish_stack & (~bearish_stack.shift(1, fill_value=False))
 
     entries = entries_raw.shift(int(shift_by), fill_value=False).astype(bool)
     exits = exits_raw.shift(int(shift_by), fill_value=False).astype(bool)
@@ -103,16 +117,23 @@ def simulate_long_only_strategy_returns(
     return out
 
 
-def compute_annualized_sharpe(returns: pd.Series, *, annualization: float = 252.0) -> float:
+def compute_annualized_sharpe(
+    returns: pd.Series,
+    *,
+    annualization: float = 252.0,
+    risk_free_rate: float = 0.0,
+) -> float:
     if not isinstance(returns, pd.Series):
         raise ValueError("returns must be a pandas Series")
     arr = pd.to_numeric(returns, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
     if arr.size == 0:
-        return float("nan")
-    vol = float(np.std(arr, ddof=0))
-    if vol <= 0.0 or not np.isfinite(vol):
-        return float("nan")
-    return float(np.mean(arr) / vol * np.sqrt(float(annualization)))
+        return 0.0
+    annual_vol = float(np.std(arr, ddof=0) * np.sqrt(float(annualization)))
+    if annual_vol <= 0.0 or not np.isfinite(annual_vol):
+        return 0.0
+    gross = float(np.prod(1.0 + arr))
+    annual_return = float(gross ** (float(annualization) / arr.size) - 1.0) if gross > 0 else -1.0
+    return float((annual_return - float(risk_free_rate)) / annual_vol)
 
 
 def evaluate_triple_ema_combo(
@@ -123,8 +144,15 @@ def evaluate_triple_ema_combo(
     slippage_rate: float = 0.0,
     shift_by: int = 1,
     annualization: float = 252.0,
+    signal_logic_mode: str = "hierarchical",
+    risk_free_rate: float = 0.0,
 ) -> dict[str, Any]:
-    entries, exits = generate_triple_ema_entry_exit_signals(close, combo, shift_by=shift_by)
+    entries, exits = generate_triple_ema_entry_exit_signals(
+        close,
+        combo,
+        shift_by=shift_by,
+        logic_mode=signal_logic_mode,
+    )
     strategy_returns = simulate_long_only_strategy_returns(
         close,
         entries,
@@ -132,7 +160,11 @@ def evaluate_triple_ema_combo(
         fee_rate=fee_rate,
         slippage_rate=slippage_rate,
     )
-    sharpe = compute_annualized_sharpe(strategy_returns, annualization=annualization)
+    sharpe = compute_annualized_sharpe(
+        strategy_returns,
+        annualization=annualization,
+        risk_free_rate=risk_free_rate,
+    )
     return {
         "combo": (int(combo[0]), int(combo[1]), int(combo[2])),
         "returns": strategy_returns,
@@ -151,6 +183,10 @@ def select_best_triple_ema_combo(
     slippage_rate: float = 0.0,
     shift_by: int = 1,
     annualization: float = 252.0,
+    require_strict_order: bool = False,
+    min_gap: int = 0,
+    signal_logic_mode: str = "hierarchical",
+    risk_free_rate: float = 0.0,
 ) -> tuple[Tuple[int, int, int], dict[str, Any]]:
     """
     Pick combo using validation Sharpe penalized by train/validation Sharpe gap:
@@ -159,8 +195,20 @@ def select_best_triple_ema_combo(
     if not combos:
         raise ValueError("combos must not be empty")
 
-    train_rows: list[dict[str, float]] = []
+    min_gap_i = max(0, int(min_gap))
+    valid_combos: list[Tuple[int, int, int]] = []
     for combo in combos:
+        c = (int(combo[0]), int(combo[1]), int(combo[2]))
+        if bool(require_strict_order) and not (c[0] < c[1] < c[2]):
+            continue
+        if min_gap_i > 0 and ((c[1] - c[0]) < min_gap_i or (c[2] - c[1]) < min_gap_i):
+            continue
+        valid_combos.append(c)
+    if not valid_combos:
+        raise ValueError("No valid EMA combos after strict-order/min-gap constraints")
+
+    train_rows: list[dict[str, float]] = []
+    for combo in valid_combos:
         r = evaluate_triple_ema_combo(
             subtrain_close,
             combo,
@@ -168,6 +216,8 @@ def select_best_triple_ema_combo(
             slippage_rate=slippage_rate,
             shift_by=shift_by,
             annualization=annualization,
+            signal_logic_mode=signal_logic_mode,
+            risk_free_rate=risk_free_rate,
         )
         train_rows.append(
             {
@@ -195,6 +245,8 @@ def select_best_triple_ema_combo(
             slippage_rate=slippage_rate,
             shift_by=shift_by,
             annualization=annualization,
+            signal_logic_mode=signal_logic_mode,
+            risk_free_rate=risk_free_rate,
         )
         val_rows.append(
             {
@@ -237,8 +289,14 @@ def build_strategy_returns_for_triple_ema_combo(
     fee_rate: float = 0.0,
     slippage_rate: float = 0.0,
     shift_by: int = 1,
+    signal_logic_mode: str = "hierarchical",
 ) -> pd.Series:
-    entries, exits = generate_triple_ema_entry_exit_signals(close, combo, shift_by=shift_by)
+    entries, exits = generate_triple_ema_entry_exit_signals(
+        close,
+        combo,
+        shift_by=shift_by,
+        logic_mode=signal_logic_mode,
+    )
     return simulate_long_only_strategy_returns(
         close,
         entries,
@@ -261,6 +319,10 @@ def build_train_test_strategy_returns_by_asset(
     slippage_rate: float = 0.0,
     shift_by: int = 1,
     annualization: float = 252.0,
+    require_strict_order: bool = False,
+    min_gap: int = 0,
+    signal_logic_mode: str = "hierarchical",
+    risk_free_rate: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     For each asset, choose best triple-EMA combo on subtrain/validation and build train/test strategy returns.
@@ -302,6 +364,10 @@ def build_train_test_strategy_returns_by_asset(
             slippage_rate=slippage_rate,
             shift_by=shift_by,
             annualization=annualization,
+            require_strict_order=require_strict_order,
+            min_gap=min_gap,
+            signal_logic_mode=signal_logic_mode,
+            risk_free_rate=risk_free_rate,
         )
 
         train_out[col] = build_strategy_returns_for_triple_ema_combo(
@@ -310,6 +376,7 @@ def build_train_test_strategy_returns_by_asset(
             fee_rate=fee_rate,
             slippage_rate=slippage_rate,
             shift_by=shift_by,
+            signal_logic_mode=signal_logic_mode,
         ).astype(float)
         test_out[col] = build_strategy_returns_for_triple_ema_combo(
             test_close,
@@ -317,6 +384,7 @@ def build_train_test_strategy_returns_by_asset(
             fee_rate=fee_rate,
             slippage_rate=slippage_rate,
             shift_by=shift_by,
+            signal_logic_mode=signal_logic_mode,
         ).astype(float)
 
         selections.append(

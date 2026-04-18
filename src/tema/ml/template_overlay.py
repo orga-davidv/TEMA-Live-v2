@@ -617,7 +617,13 @@ def compute_template_ml_overlay(
     def _metrics(series: pd.Series) -> dict:
         r = series.fillna(0.0).to_numpy(dtype=float)
         eq = np.cumprod(1.0 + r)
-        metrics = compute_backtest_metrics(r, eq, np.zeros_like(r), float(ann))
+        metrics = compute_backtest_metrics(
+            r,
+            eq,
+            np.zeros_like(r),
+            float(ann),
+            risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
+        )
         metrics["equity_final"] = float(eq[-1]) if eq.size else 1.0
         metrics["total_return"] = float(eq[-1] - 1.0) if eq.size else 0.0
         return metrics

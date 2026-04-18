@@ -1,0 +1,126 @@
+name: Validate Extension
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deterministic-gate-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONPATH: src
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy pandas scipy scikit-learn optuna
+
+      - name: Run deterministic + OOS gate validation tests
+        run: |
+          pytest -q \
+            tests/test_validate_oos_gates.py \
+            tests/test_bootstrap_validation.py \
+            tests/test_phase4_online_learning.py::test_deterministic_behavior_with_seed_and_reset \
+            tests/test_phase5_stress_scenarios.py::test_bootstrap_sampling_is_deterministic_with_seed \
+            --junitxml=deterministic-validation.xml
+
+      - name: Upload deterministic gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-gate-report
+          path: deterministic-validation.xml
+          if-no-files-found: warn
+
+  extension-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: src
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest numpy pandas scipy scikit-learn optuna
+
+      - name: Run extension validation tests
+        run: |
+          pytest -q \
+            tests/test_phase1_bayesian_hyperopt.py \
+            tests/test_phase1_dynamic_ensemble.py \
+            tests/test_phase4_feature_interactions.py \
+            tests/test_config_sweep.py \
+            tests/test_walkforward.py \
+            tests/test_phase5_stress_scenarios.py::test_stress_script_smoke \
+            --junitxml=extension-validation.xml
+
+      - name: Run stress scenario validation script
+        run: |
+          python scripts/run_stress_scenarios.py \
+            --run-id ci-stress-validation \
+            --out-root outputs_ci \
+            --seed 17 \
+            --n-paths 64 \
+            --horizon 12 \
+            --n-returns 180
+          test -f outputs_ci/ci-stress-validation/stress_scenarios.json
+
+      - name: Upload extension validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-validation-artifacts
+          path: |
+            extension-validation.xml
+            outputs_ci/ci-stress-validation/stress_scenarios.json
+          if-no-files-found: warn
+
+  parity-result-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONPATH: src
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Build parity comparison fixture
+        run: |
+          mkdir -p outputs_ci/parity-gate
+          python - <<'PY'
+          import json
+          payload = {
+              "run_a": {"sharpe": 1.00, "annual_return": 0.10, "annual_volatility": 0.11, "max_drawdown": -0.12},
+              "run_b": {"sharpe": 1.08, "annual_return": 0.11, "annual_volatility": 0.12, "max_drawdown": -0.11},
+              "diff": {"sharpe": 0.08, "annual_return": 0.01, "annual_volatility": 0.01, "max_drawdown": 0.01}
+          }
+          with open("outputs_ci/parity-gate/parity_metrics_comparison.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2)
+          PY
+
+      - name: Evaluate parity thresholds gate
+        run: |
+          python scripts/evaluate_parity_gate.py outputs_ci/parity-gate/parity_metrics_comparison.json

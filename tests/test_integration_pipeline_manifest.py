@@ -3,6 +3,7 @@ import os
 import pandas as pd
 from tema.pipeline.runner import run_pipeline
 from tema.config import BacktestConfig
+from tema.validation.manifest import load_manifest_schema, validate_manifest_schema
 
 
 def make_csv(filepath, rows=10):
@@ -33,6 +34,9 @@ def test_run_pipeline_writes_manifest_and_artifacts(tmp_path):
     assert manifest_path and os.path.exists(manifest_path)
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
+    schema = load_manifest_schema()
+    ok, errors = validate_manifest_schema(manifest, schema=schema)
+    assert ok, f"manifest schema validation failed: {errors}"
     # manifest should list artifacts and run_id
     assert manifest.get("run_id") == "integration-test-1"
     artifacts = manifest.get("artifacts", [])

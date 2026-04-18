@@ -3,28 +3,42 @@ import pandas as pd
 
 from tema.strategy_returns import (
     build_train_test_strategy_returns_by_asset,
+    compute_annualized_sharpe,
     generate_triple_ema_entry_exit_signals,
     select_best_triple_ema_combo,
     simulate_long_only_strategy_returns,
 )
+from tema.backtest import compute_backtest_metrics
 
 
-def test_generate_triple_ema_entry_exit_signals_matches_template_semantics():
+def test_generate_triple_ema_entry_exit_signals_defaults_to_hierarchical_stack_transitions():
     close = pd.Series([100.0, 101.0, 103.0, 102.0, 100.0, 99.0, 101.0], index=range(7))
     entries, exits = generate_triple_ema_entry_exit_signals(close, (2, 3, 5), shift_by=1)
 
     s1 = close.ewm(span=2, adjust=False).mean()
     s2 = close.ewm(span=3, adjust=False).mean()
     s3 = close.ewm(span=5, adjust=False).mean()
+    bullish_stack = (s1 > s2) & (s2 > s3)
+    bearish_stack = (s1 < s2) & (s2 < s3)
+
+    expected_entries = (bullish_stack & (~bullish_stack.shift(1, fill_value=False))).shift(1, fill_value=False)
+    expected_exits = (bearish_stack & (~bearish_stack.shift(1, fill_value=False))).shift(1, fill_value=False)
+
+    assert entries.equals(expected_entries.astype(bool))
+    assert exits.equals(expected_exits.astype(bool))
+
+
+def test_generate_triple_ema_entry_exit_signals_supports_legacy_or_mode():
+    close = pd.Series([100.0, 101.0, 103.0, 102.0, 100.0, 99.0, 101.0], index=range(7))
+    entries, exits = generate_triple_ema_entry_exit_signals(close, (2, 3, 5), shift_by=1, logic_mode="or")
+
+    s1 = close.ewm(span=2, adjust=False).mean()
+    s2 = close.ewm(span=3, adjust=False).mean()
+    s3 = close.ewm(span=5, adjust=False).mean()
     crossed_above = lambda a, b: (a > b) & (a.shift(1) <= b.shift(1))
     crossed_below = lambda a, b: (a < b) & (a.shift(1) >= b.shift(1))
-
-    expected_entries = (
-        crossed_above(s1, s2) | crossed_above(s1, s3) | crossed_above(s2, s3)
-    ).shift(1, fill_value=False)
-    expected_exits = (
-        crossed_below(s1, s2) | crossed_below(s1, s3) | crossed_below(s2, s3)
-    ).shift(1, fill_value=False)
+    expected_entries = (crossed_above(s1, s2) | crossed_above(s1, s3) | crossed_above(s2, s3)).shift(1, fill_value=False)
+    expected_exits = (crossed_below(s1, s2) | crossed_below(s1, s3) | crossed_below(s2, s3)).shift(1, fill_value=False)
 
     assert entries.equals(expected_entries.astype(bool))
     assert exits.equals(expected_exits.astype(bool))
@@ -74,6 +88,56 @@ def test_select_best_triple_ema_combo_uses_validation_gap_penalty(monkeypatch):
     assert np.isclose(info["subtrain_sharpe"], 1.6)
     assert np.isclose(info["val_sharpe"], 1.5)
     assert np.isclose(info["selection_score"], 1.5 - 0.5 * abs(1.6 - 1.5))
+
+
+def test_select_best_triple_ema_combo_enforces_min_gap_and_order(monkeypatch):
+    subtrain = pd.Series([1.0, 2.0, 3.0], name="subtrain")
+    validation = pd.Series([1.0, 1.5, 2.0], name="validation")
+    combos = [(2, 3, 4), (2, 5, 8), (8, 5, 2)]
+
+    def _fake_eval(close, combo, **kwargs):
+        return {"combo": combo, "returns": pd.Series(dtype=float), "sharpe": 1.0}
+
+    monkeypatch.setattr("tema.strategy_returns.evaluate_triple_ema_combo", _fake_eval)
+    best_combo, _ = select_best_triple_ema_combo(
+        subtrain,
+        validation,
+        combos,
+        validation_shortlist=2,
+        require_strict_order=True,
+        min_gap=2,
+    )
+    assert best_combo == (2, 5, 8)
+
+
+def test_compute_annualized_sharpe_matches_backtest_metric_semantics_with_rf():
+    returns = pd.Series([0.01, -0.005, 0.02, 0.0, 0.01], dtype=float)
+    rf = 0.02
+    sharpe = compute_annualized_sharpe(returns, annualization=252.0, risk_free_rate=rf)
+    eq = np.cumprod(1.0 + returns.to_numpy(dtype=float))
+    metrics = compute_backtest_metrics(
+        returns.to_numpy(dtype=float),
+        eq,
+        np.zeros(len(returns), dtype=float),
+        252.0,
+        risk_free_rate=rf,
+    )
+    assert np.isclose(sharpe, metrics["sharpe"])
+
+
+def test_compute_annualized_sharpe_zero_vol_matches_backtest_zero_guard():
+    returns = pd.Series([0.0, 0.0, 0.0, 0.0], dtype=float)
+    sharpe = compute_annualized_sharpe(returns, annualization=252.0, risk_free_rate=0.01)
+    eq = np.cumprod(1.0 + returns.to_numpy(dtype=float))
+    metrics = compute_backtest_metrics(
+        returns.to_numpy(dtype=float),
+        eq,
+        np.zeros(len(returns), dtype=float),
+        252.0,
+        risk_free_rate=0.01,
+    )
+    assert sharpe == 0.0
+    assert sharpe == metrics["sharpe"]
 
 
 def test_build_train_test_strategy_returns_by_asset_uses_selected_combo(monkeypatch):

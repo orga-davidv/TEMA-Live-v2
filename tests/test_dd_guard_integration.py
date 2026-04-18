@@ -29,5 +29,6 @@ def test_dd_guard_enabled_does_not_crash_and_writes_artifact(tmp_path, monkeypat
 
     info = json.loads(dd_path.read_text(encoding="utf-8"))
     assert info.get("enabled") is True
+    assert info.get("allow_full_derisk") is True
     assert info.get("applied") is True
     assert int(info.get("test_periods", 0)) > 0

@@ -6,7 +6,7 @@ from .loader import (
     resolve_data_dir,
 )
 from .quality import DataQualityConfig, DataQualityFailed, compute_data_quality_report
-from .splitter import split_train_test, split_panel_per_asset
+from .splitter import split_train_test, split_panel_per_asset, split_grid_subtrain_validation
 
 __all__ = [
     "DEFAULT_DATA_CANDIDATES",
@@ -16,6 +16,7 @@ __all__ = [
     "load_price_panel",
     "split_train_test",
     "split_panel_per_asset",
+    "split_grid_subtrain_validation",
     "DataQualityConfig",
     "DataQualityFailed",
     "compute_data_quality_report",

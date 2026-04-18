@@ -140,3 +140,34 @@ def split_panel_per_asset(
 
 # convenience alias
 split_train_test_per_asset = split_panel_per_asset
+
+
+def split_grid_subtrain_validation(
+    train_close: pd.Series,
+    *,
+    validation_ratio: float = 0.25,
+    validation_min_rows: int = 20,
+) -> tuple[pd.Series, pd.Series, int]:
+    """Chronological subtrain/validation split for OOS combo selection.
+
+    This mirrors the template grid-validation split shape used by the monolith:
+    a tail validation window carved out from the train partition, with clamping
+    so both sides keep enough rows.
+    """
+    if not isinstance(train_close, pd.Series):
+        raise ValueError("train_close must be a pandas Series")
+    n_rows = len(train_close)
+    if n_rows < 3:
+        raise ValueError(f"train_close must have at least 3 rows, got {n_rows}")
+    if not 0.0 < float(validation_ratio) < 1.0:
+        raise ValueError("validation_ratio must be strictly between 0 and 1")
+
+    split_idx = int(n_rows * (1.0 - float(validation_ratio)))
+    min_rows = max(1, int(validation_min_rows))
+    if n_rows > 2 * min_rows:
+        split_idx = max(min_rows, min(split_idx, n_rows - min_rows))
+    split_idx = max(1, min(split_idx, n_rows - 1))
+
+    subtrain_close = train_close.iloc[:split_idx].copy()
+    validation_close = train_close.iloc[split_idx:].copy()
+    return subtrain_close, validation_close, int(split_idx)

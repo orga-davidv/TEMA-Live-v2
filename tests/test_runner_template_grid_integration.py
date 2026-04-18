@@ -17,6 +17,19 @@ def test_build_template_grid_combos_is_deterministic_and_filters_invalid():
     assert combos == [(3, 4, 8), (3, 4, 10), (3, 8, 10), (5, 8, 10)]
 
 
+def test_build_template_grid_combos_enforces_min_gap_when_configured():
+    cfg = BacktestConfig(
+        template_default_universe=True,
+        template_grid_short_periods=(3, 4),
+        template_grid_mid_periods=(5, 7),
+        template_grid_long_periods=(8, 10),
+        template_grid_require_strict_order=True,
+        template_grid_min_gap=3,
+    )
+    combos = pipeline_runner._build_template_grid_combos(cfg)
+    assert combos == [(3, 7, 10), (4, 7, 10)]
+
+
 def test_load_data_context_template_uses_train_test_grid_builder(monkeypatch):
     idx = pd.date_range("2024-01-01", periods=6, freq="D")
     price_df = pd.DataFrame({"A": [100, 101, 102, 103, 104, 105], "B": [50, 50, 51, 52, 53, 54]}, index=idx, dtype=float)
@@ -50,6 +63,9 @@ def test_load_data_context_template_uses_train_test_grid_builder(monkeypatch):
     assert calls["train_shape"] == train_df.shape
     assert calls["test_shape"] == test_df.shape
     assert len(calls["combos"]) > 0
+    assert calls["kwargs"]["require_strict_order"] is True
+    assert calls["kwargs"]["min_gap"] == 0
+    assert calls["kwargs"]["signal_logic_mode"] == "hierarchical"
     assert ctx["strategy_grid_diagnostics"]["mode"] == "template_train_validation_grid"
     assert ctx["strategy_grid_diagnostics"]["selected_assets"] == 2
     assert len(ctx["strategy_combo_selection"]) == 2

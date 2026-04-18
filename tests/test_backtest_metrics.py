@@ -27,6 +27,19 @@ def test_run_return_equity_simulation_computes_core_metrics():
     assert "annualized_turnover" in res.metrics
 
 
+def test_run_return_equity_simulation_applies_risk_free_rate_to_sharpe():
+    asset_returns = np.array([[0.01], [-0.02], [0.03]], dtype=float)
+    target_weights = np.array([[1.0], [1.0], [1.0]], dtype=float)
+    rf = 0.02
+    res = run_return_equity_simulation(asset_returns, target_weights, freq="D", risk_free_rate=rf)
+
+    expected_vol = float(np.std(asset_returns[:, 0], ddof=0) * np.sqrt(252.0))
+    gross = float(np.prod(1.0 + asset_returns[:, 0]))
+    expected_annual_return = float(gross ** (252.0 / len(asset_returns[:, 0])) - 1.0) if gross > 0 else -1.0
+    expected_sharpe = 0.0 if expected_vol <= 1e-12 else (expected_annual_return - rf) / expected_vol
+    assert abs(res.metrics["sharpe"] - expected_sharpe) < 1e-10
+
+
 def test_build_weight_schedule_from_signals_has_safe_fallback():
     import pandas as pd
 
