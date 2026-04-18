@@ -103,6 +103,12 @@ class BacktestConfig:
     vol_target_reference: str = "bl"
     vol_target_apply_to_ml: bool = False
 
+    # Drawdown guard overlay (exposure reduction during sustained drawdowns)
+    dd_guard_enabled: bool = False
+    dd_guard_max_drawdown: float = 0.10
+    dd_guard_floor: float = 0.25
+    dd_guard_recovery_halflife: int = 20
+
     # Dynamic ensemble controls (Phase 1)
     ensemble_enabled: bool = False
     ensemble_lookback: int = 20
