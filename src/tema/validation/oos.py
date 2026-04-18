@@ -2,7 +2,7 @@ import json
 import os
 from typing import Dict, Any, Optional, Tuple
 
-from .validation import load_manifest
+from .manifest import load_manifest
 
 
 def _load_json(path: str) -> Dict[str, Any]:

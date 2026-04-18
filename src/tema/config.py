@@ -124,6 +124,11 @@ class BacktestConfig:
     # Costs
     fee_rate: float = 0.0005
     slippage_rate: float = 0.0005
+    # Execution cost model settings (neutral defaults preserve legacy behaviour)
+    cost_model: str = "simple"
+    spread_bps: float = 0.0
+    impact_coeff: float = 0.0
+    borrow_bps: float = 0.0
 
     # Generic
     freq: str = "D"

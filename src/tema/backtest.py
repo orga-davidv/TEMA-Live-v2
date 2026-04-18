@@ -5,6 +5,7 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
+from .execution.costs import compute_transaction_cost
 
 
 def _annualization_factor(freq: str) -> float:
@@ -58,6 +59,10 @@ def run_return_equity_simulation(
     *,
     fee_rate: float = 0.0,
     slippage_rate: float = 0.0,
+    cost_model: str = "simple",
+    spread_bps: float = 0.0,
+    impact_coeff: float = 0.0,
+    borrow_bps: float = 0.0,
     freq: str = "D",
 ) -> BacktestResult:
     ret = np.asarray(asset_returns, dtype=float)
@@ -73,7 +78,6 @@ def run_return_equity_simulation(
 
     # Walk-forward-friendly execution: apply previous target weights to current period return.
     executed = np.vstack([w[0], w[:-1]])
-    total_cost_rate = float(fee_rate + slippage_rate)
     periodic_returns = np.zeros(ret.shape[0], dtype=float)
     turnover_series = np.zeros(ret.shape[0], dtype=float)
     prev = executed[0]
@@ -81,7 +85,21 @@ def run_return_equity_simulation(
         cur = executed[t]
         turnover = float(np.sum(np.abs(cur - prev)))
         pnl = float(np.dot(cur, ret[t]))
-        periodic_returns[t] = pnl - turnover * total_cost_rate
+        # compute transaction cost using the configured cost model
+        cost = compute_transaction_cost(
+            turnover,
+            prev,
+            cur,
+            exposure=cur,
+            fee_rate=fee_rate,
+            slippage_rate=slippage_rate,
+            cost_model=cost_model,
+            spread_bps=spread_bps,
+            impact_coeff=impact_coeff,
+            borrow_bps=borrow_bps,
+        )
+
+        periodic_returns[t] = pnl - float(cost)
         turnover_series[t] = turnover
         prev = cur
     equity = np.cumprod(1.0 + periodic_returns)

@@ -28,7 +28,7 @@ def check_artifacts_exist(manifest: Dict, out_dir: str) -> Tuple[bool, List[str]
 
 
 def compare_manifests(mod_manifest_path: str, legacy_manifest_path: str) -> Dict:
-    """Compare modular manifest with legacy manifest and return a structured report.
+    """Compare modular manifest with legacy_manifest and return a structured report.
 
     Checks performed:
     - manifest required keys (modular)

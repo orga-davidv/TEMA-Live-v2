@@ -14,7 +14,7 @@ src_path = os.path.join(repo_root, "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from tema.validation_oos import validate_oos_gates
+from tema.validation.oos import validate_oos_gates
 
 
 def main():

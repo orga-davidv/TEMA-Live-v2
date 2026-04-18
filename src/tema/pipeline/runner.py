@@ -573,6 +573,10 @@ def _backtest_stage(
             target_weights=weights_path,
             fee_rate=sim_fee,
             slippage_rate=sim_slippage,
+            cost_model=cfg.cost_model,
+            spread_bps=cfg.spread_bps,
+            impact_coeff=cfg.impact_coeff,
+            borrow_bps=cfg.borrow_bps,
             freq=cfg.freq,
         )
         return {
@@ -601,6 +605,10 @@ def _backtest_stage(
             target_weights=weights_path,
             fee_rate=cfg.fee_rate,
             slippage_rate=cfg.slippage_rate,
+            cost_model=cfg.cost_model,
+            spread_bps=cfg.spread_bps,
+            impact_coeff=cfg.impact_coeff,
+            borrow_bps=cfg.borrow_bps,
             freq=cfg.freq,
         )
         return {

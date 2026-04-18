@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 
-from tema.validation_oos import validate_oos_gates
+from tema.validation.oos import validate_oos_gates
 
 
 def _write_manifest_and_perf(tmpdir, artifacts: dict):
