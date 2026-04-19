@@ -22,6 +22,15 @@ def test_generate_crossover_signal_matrix_expected_shape():
     assert set(sig["asset_a"].unique()).issubset({-1.0, 0.0, 1.0})
 
 
+def test_python_signal_engine_default_shift_matches_unshifted_signals():
+    idx = pd.date_range("2024-01-01", periods=6, freq="D", tz="UTC")
+    df = pd.DataFrame({"asset_a": [1, 2, 3, 2, 1, 2]}, index=idx)
+    engine = PythonSignalEngine()
+    got = engine.generate(df, fast_period=2, slow_period=3, method="ema")
+    expected = generate_crossover_signal_matrix(df, fast_period=2, slow_period=3, method="ema", shift_by=0)
+    pd.testing.assert_frame_equal(got, expected)
+
+
 def test_resolve_signal_engine_cpp_fallback():
     engine = resolve_signal_engine(use_cpp=True, cpp_engine=None)
     assert hasattr(engine, "generate")

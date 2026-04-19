@@ -918,7 +918,12 @@ def run_modular(
         **profile_overrides,
     )
     res = rp(run_id=run_id, cfg=cfg, out_root=out_root)
-    bridge_enabled = bool(parity_metrics_bridge or os.environ.get("TEMA_PARITY_METRICS_BRIDGE", "0") == "1")
+    # Bridge activation is now explicit-only: only enable when the caller
+    # passed parity_metrics_bridge=True. Previously the environment variable
+    # TEMA_PARITY_METRICS_BRIDGE could implicitly enable the bridge which
+    # allowed hidden overrides; remove that implicit path to make parity
+    # activation explicit and easier to reason about in CI.
+    bridge_enabled = bool(parity_metrics_bridge)
     if bridge_enabled:
         _apply_parity_metrics_bridge(
             run_result=res,

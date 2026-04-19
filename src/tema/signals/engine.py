@@ -20,7 +20,8 @@ class SignalEngine(Protocol):
 
 @dataclass
 class PythonSignalEngine:
-    shift_by: int = 1
+    # Keep signals unshifted here; execution applies the single walk-forward lag.
+    shift_by: int = 0
 
     def generate(
         self,

@@ -118,7 +118,7 @@ class _CppSignalEngine:
             fast_period=fast_period,
             slow_period=slow_period,
             method=method,
-            shift_by=1,
+            shift_by=0,
         )
 
 
@@ -145,7 +145,7 @@ def get_signal_engine(prefer_cpp: bool = True) -> SignalEngine:
                 fast_period=fast_period,
                 slow_period=slow_period,
                 method=method,
-                shift_by=1,
+                shift_by=0,
             )
 
     return _BareFallback()

@@ -44,11 +44,12 @@ def test_compare_runs(tmp_path):
 
 
 def test_evaluate_parity_thresholds_pass_and_fail():
+    # diffs chosen to be within the new stricter defaults (see parity_compare.DEFAULT_PARITY_THRESHOLDS)
     comp_ok = {
         "diff": {
-            "sharpe": 0.1,
-            "annual_return": 0.01,
-            "annual_volatility": 0.02,
+            "sharpe": 0.01,
+            "annual_return": 0.003,
+            "annual_volatility": 0.005,
             "max_drawdown": -0.01,
         }
     }

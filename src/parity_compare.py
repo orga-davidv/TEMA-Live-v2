@@ -8,11 +8,20 @@ import json
 import os
 from typing import Dict, Any, Optional
 
+# Stricter defaults for the parity gate. These are intentionally tight to
+# catch easy-to-miss metric overrides when comparing template/legacy metrics
+# against the modular run outputs. Choices:
+#  - sharpe: 0.02  (small Sharpe gaps can be material in ranking)
+#  - annual_return: 0.005  (~0.5% absolute return gap)
+#  - annual_volatility: 0.01  (1 percentage point volatility gap)
+#  - max_drawdown: 0.02  (2 percentage points drawdown gap)
+# These defaults are conservative but stricter than historical values and can
+# be overridden by callers/tests via the `thresholds` argument.
 DEFAULT_PARITY_THRESHOLDS: Dict[str, float] = {
-    "sharpe": 0.20,
-    "annual_return": 0.03,
-    "annual_volatility": 0.03,
-    "max_drawdown": 0.03,
+    "sharpe": 0.02,
+    "annual_return": 0.005,
+    "annual_volatility": 0.01,
+    "max_drawdown": 0.02,
 }
 
 
