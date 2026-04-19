@@ -1,0 +1,2 @@
+enabled,method,hmm_n_states,bull_state,factor,pre_vol,post_vol,train_raw_scalar_stats,test_raw_scalar_stats,max_scalar,hmm_scalar_floor,hmm_scalar_ceiling,applied_scalar_train_mean
+True,hmm_prob_python,3,2,209.28937211324592,0.00047780734869752616,0.07887234781095374,"{'mean': 0.3008258713996803, 'median': 0.30001510209544197, 'p90': 0.3000186727028032, 'max': 1.4999999924082323}","{'mean': 0.3010241939724764, 'median': 0.3000151033472829, 'p90': 0.3000182237209396, 'max': 1.4999999924082323}",50.0,0.3,1.5,50.0

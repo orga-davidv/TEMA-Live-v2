@@ -60,7 +60,17 @@ def _extract_legacy_performance(
     }
 
 
-def _apply_parity_metrics_bridge(run_result: dict, metrics_dataset: str, metrics_csv_path: str | None = None) -> None:
+def _apply_parity_metrics_bridge(
+    run_result: dict,
+    metrics_dataset: str,
+    metrics_csv_path: str | None = None,
+    *,
+    strict_independent_mode: bool = False,
+) -> None:
+    if strict_independent_mode:
+        raise ValueError(
+            "strict_independent_mode violation: parity metrics bridge uses legacy comparator CSV source"
+        )
     out_dir = run_result.get("out_dir")
     if not out_dir:
         raise ValueError("run_result missing out_dir required for parity bridge")
@@ -97,11 +107,43 @@ def _apply_parity_metrics_bridge(run_result: dict, metrics_dataset: str, metrics
             "parity_metrics_bridge_applied": True,
             "parity_metrics_bridge_dataset": legacy_perf.get("legacy_dataset"),
             "parity_metrics_bridge_source": legacy_perf.get("legacy_metrics_source"),
+            "benchmark_injection_detected": True,
+            "benchmark_injection_sources": ["parity_metrics_bridge.legacy_metrics_csv"],
+            "strict_independent_mode": False,
         }
     )
+    source = perf.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    source.update(
+        {
+            "benchmark_injection_detected": True,
+            "benchmark_injection_sources": ["parity_metrics_bridge.legacy_metrics_csv"],
+            "strict_independent_mode": False,
+        }
+    )
+    perf["source"] = source
 
     with open(perf_path, "w", encoding="utf-8") as fh:
         json.dump(perf, fh, indent=2)
+
+    returns_info_path = Path(out_dir) / "returns_csv_info.json"
+    if returns_info_path.exists():
+        with open(returns_info_path, "r", encoding="utf-8") as fh:
+            returns_info = json.load(fh)
+        existing_sources = returns_info.get("benchmark_injection_sources", [])
+        if not isinstance(existing_sources, list):
+            existing_sources = []
+        merged_sources = list(dict.fromkeys([*existing_sources, "parity_metrics_bridge.legacy_metrics_csv"]))
+        returns_info.update(
+            {
+                "benchmark_injection_detected": True,
+                "benchmark_injection_sources": merged_sources,
+                "strict_independent_mode": False,
+            }
+        )
+        with open(returns_info_path, "w", encoding="utf-8") as fh:
+            json.dump(returns_info, fh, indent=2)
 
 
 def _write_json(path: Path, payload: dict) -> None:
@@ -478,12 +520,38 @@ def run_modular(
     portfolio_risk_aversion: float = 2.5,
     portfolio_bl_tau: float = 0.05,
     portfolio_bl_view_confidence: float = 0.65,
+    portfolio_bl_omega_scale: float = 0.25,
+    portfolio_bl_max_weight: float = 0.15,
     ml_hmm_scalar_floor: float = 0.30,
     ml_hmm_scalar_ceiling: float = 1.50,
     vol_target_apply_to_ml: bool = False,
     template_default_universe: bool = False,
+    template_use_precomputed_artifacts: bool = True,
+    ml_meta_comparator_use_benchmark_csv: bool = False,
+    cle_enabled: bool = False,
+    cle_use_external_proxies: bool = False,
+    cle_mode: str = "confluence_blend",
+    cle_mapping_mode: str = "linear",
+    cle_mapping_min_multiplier: float = 0.5,
+    cle_mapping_max_multiplier: float = 1.5,
+    cle_mapping_step_thresholds: tuple[float, ...] = (0.30, 0.70),
+    cle_mapping_step_multipliers: tuple[float, ...] = (0.50, 1.00, 1.50),
+    cle_mapping_kelly_gamma: float = 2.0,
+    cle_gate_event_blackout_cap: float = 0.5,
+    cle_gate_liquidity_spread_z_threshold: float = 2.0,
+    cle_gate_liquidity_depth_threshold: float = 0.10,
+    cle_gate_liquidity_reduction_factor: float = 0.25,
+    cle_gate_correlation_alert_cap: float = 1.0,
+    cle_leverage_floor: float = 0.0,
+    cle_leverage_cap: float = 12.0,
+    cle_policy_seed: int = 42,
+    cle_online_calibration_enabled: bool = False,
+    cle_online_calibration_window: int = 5,
+    cle_online_calibration_learning_rate: float = 0.10,
+    cle_online_calibration_l2: float = 1e-4,
     parity_metrics_bridge: bool = False,
     parity_metrics_dataset: str | None = None,
+    strict_independent_mode: bool = False,
 ):
     from tema.pipeline import run_pipeline as rp
     from tema.config import BacktestConfig
@@ -503,6 +571,9 @@ def run_modular(
         effective_data_path = "merged_d1"
     effective_signal_fast_period = 3 if template_default_universe else 5
     effective_signal_slow_period = 20
+    effective_template_grid_signal_logic = (
+        "or" if template_default_universe and (not template_use_precomputed_artifacts) else "hierarchical"
+    )
 
     # Determine ML overlay defaults with explicit-intent semantics:
     # - If caller explicitly set ml_template_overlay (True/False), preserve it.
@@ -538,6 +609,7 @@ def run_modular(
         data_path=effective_data_path,
         signal_fast_period=effective_signal_fast_period,
         signal_slow_period=effective_signal_slow_period,
+        template_grid_signal_logic=effective_template_grid_signal_logic,
         ml_enabled=ml_enabled,
         ml_modular_path_enabled=ml_modular_path_enabled,
         ml_template_overlay_enabled=effective_ml_template_overlay,
@@ -549,10 +621,36 @@ def run_modular(
         portfolio_risk_aversion=portfolio_risk_aversion,
         portfolio_bl_tau=portfolio_bl_tau,
         portfolio_bl_view_confidence=portfolio_bl_view_confidence,
+        portfolio_bl_omega_scale=portfolio_bl_omega_scale,
+        portfolio_bl_max_weight=portfolio_bl_max_weight,
         ml_hmm_scalar_floor=ml_hmm_scalar_floor,
         ml_hmm_scalar_ceiling=ml_hmm_scalar_ceiling,
         vol_target_apply_to_ml=vol_target_apply_to_ml,
         template_default_universe=template_default_universe,
+        template_use_precomputed_artifacts=template_use_precomputed_artifacts,
+        ml_meta_comparator_use_benchmark_csv=ml_meta_comparator_use_benchmark_csv,
+        strict_independent_mode=strict_independent_mode,
+        cle_enabled=cle_enabled,
+        cle_use_external_proxies=cle_use_external_proxies,
+        cle_mode=cle_mode,
+        cle_mapping_mode=cle_mapping_mode,
+        cle_mapping_min_multiplier=cle_mapping_min_multiplier,
+        cle_mapping_max_multiplier=cle_mapping_max_multiplier,
+        cle_mapping_step_thresholds=cle_mapping_step_thresholds,
+        cle_mapping_step_multipliers=cle_mapping_step_multipliers,
+        cle_mapping_kelly_gamma=cle_mapping_kelly_gamma,
+        cle_gate_event_blackout_cap=cle_gate_event_blackout_cap,
+        cle_gate_liquidity_spread_z_threshold=cle_gate_liquidity_spread_z_threshold,
+        cle_gate_liquidity_depth_threshold=cle_gate_liquidity_depth_threshold,
+        cle_gate_liquidity_reduction_factor=cle_gate_liquidity_reduction_factor,
+        cle_gate_correlation_alert_cap=cle_gate_correlation_alert_cap,
+        cle_leverage_floor=cle_leverage_floor,
+        cle_leverage_cap=cle_leverage_cap,
+        cle_policy_seed=cle_policy_seed,
+        cle_online_calibration_enabled=cle_online_calibration_enabled,
+        cle_online_calibration_window=cle_online_calibration_window,
+        cle_online_calibration_learning_rate=cle_online_calibration_learning_rate,
+        cle_online_calibration_l2=cle_online_calibration_l2,
     )
     res = rp(run_id=run_id, cfg=cfg, out_root=out_root)
     bridge_enabled = bool(parity_metrics_bridge or os.environ.get("TEMA_PARITY_METRICS_BRIDGE", "0") == "1")
@@ -561,6 +659,7 @@ def run_modular(
             run_result=res,
             metrics_dataset=parity_metrics_dataset or os.environ.get("TEMA_LEGACY_METRICS_DATASET", "test"),
             metrics_csv_path=os.environ.get("TEMA_LEGACY_METRICS_PATH"),
+            strict_independent_mode=bool(strict_independent_mode),
         )
     if default_validation_suite_enabled:
         res["default_validation_suite"] = _run_default_validation_suite(
@@ -574,6 +673,16 @@ def run_modular(
             charts_enabled=validation_graphs_enabled,
         )
     return res
+
+
+def _parse_csv_floats(value: str) -> tuple[float, ...]:
+    tokens = [token.strip() for token in str(value).split(",")]
+    if not tokens or any(token == "" for token in tokens):
+        raise argparse.ArgumentTypeError("expected comma-separated float values")
+    try:
+        return tuple(float(token) for token in tokens)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected comma-separated float values") from exc
 
 
 def main(argv=None):
@@ -607,10 +716,48 @@ def main(argv=None):
     p.add_argument("--portfolio-risk-aversion", type=float, default=2.5)
     p.add_argument("--portfolio-bl-tau", type=float, default=0.05)
     p.add_argument("--portfolio-view-confidence", type=float, default=0.65)
+    p.add_argument("--portfolio-bl-omega-scale", type=float, default=0.25)
+    p.add_argument("--portfolio-bl-max-weight", type=float, default=0.15)
     p.add_argument("--ml-hmm-scalar-floor", type=float, default=0.30)
     p.add_argument("--ml-hmm-scalar-ceiling", type=float, default=1.50)
     p.add_argument("--vol-target-apply-to-ml", action="store_true")
     p.add_argument("--template-default-universe", action="store_true", help="Use template-like universe defaults (merged_d1, min_rows=400, train_ratio=0.60, full asset set)")
+    p.add_argument(
+        "--no-template-precomputed-artifacts",
+        action="store_true",
+        help="Disable template precomputed artifacts/benchmark CSV overrides and use computed modular path only",
+    )
+    p.add_argument(
+        "--ml-meta-comparator-benchmark-csv",
+        action="store_true",
+        help="Optional parity mode: allow ML_META benchmark CSV loading even with --no-template-precomputed-artifacts",
+    )
+    p.add_argument(
+        "--strict-independent",
+        action="store_true",
+        help="Fail if benchmark/comparator CSV data is injected into modular run outputs",
+    )
+    p.add_argument("--cle-enabled", action="store_true", help="Enable Confluence Leverage Engine policy wiring")
+    p.add_argument("--cle-use-external-proxies", action="store_true", help="Enable CLE external proxy feature inputs")
+    p.add_argument("--cle-mode", default="confluence_blend")
+    p.add_argument("--cle-mapping-mode", default="linear", help="CLE mapping mode (linear/stepwise/kelly_shrink)")
+    p.add_argument("--cle-mapping-min-multiplier", type=float, default=0.5)
+    p.add_argument("--cle-mapping-max-multiplier", type=float, default=1.5)
+    p.add_argument("--cle-mapping-step-thresholds", type=_parse_csv_floats, default=(0.30, 0.70), help="Comma-separated CLE step thresholds")
+    p.add_argument("--cle-mapping-step-multipliers", type=_parse_csv_floats, default=(0.50, 1.00, 1.50), help="Comma-separated CLE step multipliers")
+    p.add_argument("--cle-mapping-kelly-gamma", type=float, default=2.0)
+    p.add_argument("--cle-gate-event-blackout-cap", type=float, default=0.5)
+    p.add_argument("--cle-gate-liquidity-spread-z-threshold", type=float, default=2.0)
+    p.add_argument("--cle-gate-liquidity-depth-threshold", type=float, default=0.10)
+    p.add_argument("--cle-gate-liquidity-reduction-factor", type=float, default=0.25)
+    p.add_argument("--cle-gate-correlation-alert-cap", type=float, default=1.0)
+    p.add_argument("--cle-leverage-floor", type=float, default=0.0)
+    p.add_argument("--cle-leverage-cap", type=float, default=12.0)
+    p.add_argument("--cle-policy-seed", type=int, default=42)
+    p.add_argument("--cle-online-calibration-enabled", action="store_true")
+    p.add_argument("--cle-online-calibration-window", type=int, default=5)
+    p.add_argument("--cle-online-calibration-learning-rate", type=float, default=0.10)
+    p.add_argument("--cle-online-calibration-l2", type=float, default=1e-4)
     p.add_argument("--parity-metrics-bridge", action="store_true", help="Override modular performance metrics with latest legacy metrics CSV for strict parity validation")
     p.add_argument("--legacy-metrics-dataset", default=None, help="Dataset row to read from Template/bl_portfolio_metrics.csv (e.g. test, test_ml)")
     args = p.parse_args(argv)
@@ -647,10 +794,36 @@ def main(argv=None):
             portfolio_risk_aversion=args.portfolio_risk_aversion,
             portfolio_bl_tau=args.portfolio_bl_tau,
             portfolio_bl_view_confidence=args.portfolio_view_confidence,
+            portfolio_bl_omega_scale=args.portfolio_bl_omega_scale,
+            portfolio_bl_max_weight=args.portfolio_bl_max_weight,
             ml_hmm_scalar_floor=args.ml_hmm_scalar_floor,
             ml_hmm_scalar_ceiling=args.ml_hmm_scalar_ceiling,
             vol_target_apply_to_ml=args.vol_target_apply_to_ml,
             template_default_universe=args.template_default_universe,
+            template_use_precomputed_artifacts=(not args.no_template_precomputed_artifacts),
+            ml_meta_comparator_use_benchmark_csv=args.ml_meta_comparator_benchmark_csv,
+            strict_independent_mode=args.strict_independent,
+            cle_enabled=args.cle_enabled,
+            cle_use_external_proxies=args.cle_use_external_proxies,
+            cle_mode=args.cle_mode,
+            cle_mapping_mode=args.cle_mapping_mode,
+            cle_mapping_min_multiplier=args.cle_mapping_min_multiplier,
+            cle_mapping_max_multiplier=args.cle_mapping_max_multiplier,
+            cle_mapping_step_thresholds=args.cle_mapping_step_thresholds,
+            cle_mapping_step_multipliers=args.cle_mapping_step_multipliers,
+            cle_mapping_kelly_gamma=args.cle_mapping_kelly_gamma,
+            cle_gate_event_blackout_cap=args.cle_gate_event_blackout_cap,
+            cle_gate_liquidity_spread_z_threshold=args.cle_gate_liquidity_spread_z_threshold,
+            cle_gate_liquidity_depth_threshold=args.cle_gate_liquidity_depth_threshold,
+            cle_gate_liquidity_reduction_factor=args.cle_gate_liquidity_reduction_factor,
+            cle_gate_correlation_alert_cap=args.cle_gate_correlation_alert_cap,
+            cle_leverage_floor=args.cle_leverage_floor,
+            cle_leverage_cap=args.cle_leverage_cap,
+            cle_policy_seed=args.cle_policy_seed,
+            cle_online_calibration_enabled=args.cle_online_calibration_enabled,
+            cle_online_calibration_window=args.cle_online_calibration_window,
+            cle_online_calibration_learning_rate=args.cle_online_calibration_learning_rate,
+            cle_online_calibration_l2=args.cle_online_calibration_l2,
             parity_metrics_bridge=args.parity_metrics_bridge,
             parity_metrics_dataset=args.legacy_metrics_dataset,
         )

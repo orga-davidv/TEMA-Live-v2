@@ -37,6 +37,9 @@ jobs:
             tests/test_validate_oos_gates.py \
             tests/test_phase4_online_learning.py \
             tests/test_phase5_stress_scenarios.py \
+            tests/test_external_adapters.py \
+            tests/test_leverage_core_modules.py \
+            tests/test_pipeline_leverage_wireup.py \
             --junitxml=pytest-fast.xml
 
       - name: Upload fast test report

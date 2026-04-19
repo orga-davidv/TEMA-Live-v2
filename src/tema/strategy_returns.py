@@ -232,7 +232,12 @@ def select_best_triple_ema_combo(
     rank_col = train_df["subtrain_sharpe"].replace([np.inf, -np.inf], np.nan).fillna(-np.inf)
     train_df = train_df.assign(_rank=rank_col).sort_values("_rank", ascending=False).drop(columns=["_rank"])
 
-    shortlist_n = len(train_df) if validation_shortlist is None else max(1, min(int(validation_shortlist), len(train_df)))
+    if validation_shortlist is None:
+        shortlist_n = len(train_df)
+    else:
+        # Template semantics: always validate at least top-10 combos (when available).
+        shortlist_n = max(10, int(validation_shortlist))
+        shortlist_n = max(1, min(shortlist_n, len(train_df)))
     shortlist = train_df.head(shortlist_n).copy()
 
     val_rows: list[dict[str, float]] = []
@@ -323,9 +328,12 @@ def build_train_test_strategy_returns_by_asset(
     min_gap: int = 0,
     signal_logic_mode: str = "hierarchical",
     risk_free_rate: float = 0.0,
+    combo_anchors: Optional[dict[str, Tuple[int, int, int]]] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     For each asset, choose best triple-EMA combo on subtrain/validation and build train/test strategy returns.
+    If `combo_anchors` provides an asset combo, that combo is used deterministically
+    (while still recomputing returns from source prices).
     """
     if not isinstance(train_close_df, pd.DataFrame) or not isinstance(test_close_df, pd.DataFrame):
         raise ValueError("train_close_df and test_close_df must be pandas DataFrames")
@@ -337,38 +345,84 @@ def build_train_test_strategy_returns_by_asset(
     train_out = pd.DataFrame(index=train_close_df.index, columns=train_close_df.columns, dtype=float)
     test_out = pd.DataFrame(index=test_close_df.index, columns=test_close_df.columns, dtype=float)
     selections: list[dict[str, Any]] = []
+    skipped_assets: list[dict[str, Any]] = []
+    anchor_map = {str(k): (int(v[0]), int(v[1]), int(v[2])) for k, v in (combo_anchors or {}).items()}
 
     for col in train_close_df.columns:
-        train_close = pd.to_numeric(train_close_df[col], errors="coerce").astype(float)
-        test_close = pd.to_numeric(test_close_df[col], errors="coerce").astype(float)
+        train_close = pd.to_numeric(train_close_df[col], errors="coerce").astype(float).dropna()
+        test_close = pd.to_numeric(test_close_df[col], errors="coerce").astype(float).dropna()
         n = len(train_close)
-        if n < 3:
-            raise ValueError(f"Asset '{col}' has insufficient train rows ({n})")
+        n_test = len(test_close)
+        if n < 3 or n_test < 2:
+            skipped_assets.append(
+                {
+                    "asset": str(col),
+                    "reason": "insufficient_dense_rows",
+                    "train_rows": int(n),
+                    "test_rows": int(n_test),
+                }
+            )
+            continue
 
         split_idx = int(n * (1.0 - float(validation_ratio)))
         min_rows = max(1, int(validation_min_rows))
-        if n > 2 * min_rows:
-            split_idx = max(min_rows, min(split_idx, n - min_rows))
+        # Template split semantics:
+        #   split_idx = max(min_rows, min(split_idx, n - min_rows))
+        # Keep safety clamp so extremely small windows still produce a valid split.
+        split_idx = max(min_rows, min(split_idx, n - min_rows))
         split_idx = max(1, min(split_idx, n - 1))
 
         subtrain_close = train_close.iloc[:split_idx].copy()
         validation_close = train_close.iloc[split_idx:].copy()
 
-        best_combo, info = select_best_triple_ema_combo(
-            subtrain_close=subtrain_close,
-            validation_close=validation_close,
-            combos=combos,
-            validation_shortlist=validation_shortlist,
-            overfit_penalty=overfit_penalty,
-            fee_rate=fee_rate,
-            slippage_rate=slippage_rate,
-            shift_by=shift_by,
-            annualization=annualization,
-            require_strict_order=require_strict_order,
-            min_gap=min_gap,
-            signal_logic_mode=signal_logic_mode,
-            risk_free_rate=risk_free_rate,
-        )
+        selection_source = "train_validation_grid"
+        anchor_combo = anchor_map.get(str(col))
+        if anchor_combo is not None:
+            best_combo = (int(anchor_combo[0]), int(anchor_combo[1]), int(anchor_combo[2]))
+            subtrain_eval = evaluate_triple_ema_combo(
+                subtrain_close,
+                best_combo,
+                fee_rate=fee_rate,
+                slippage_rate=slippage_rate,
+                shift_by=shift_by,
+                annualization=annualization,
+                signal_logic_mode=signal_logic_mode,
+                risk_free_rate=risk_free_rate,
+            )
+            val_eval = evaluate_triple_ema_combo(
+                validation_close,
+                best_combo,
+                fee_rate=fee_rate,
+                slippage_rate=slippage_rate,
+                shift_by=shift_by,
+                annualization=annualization,
+                signal_logic_mode=signal_logic_mode,
+                risk_free_rate=risk_free_rate,
+            )
+            subtrain_sharpe = float(subtrain_eval["sharpe"])
+            val_sharpe = float(val_eval["sharpe"])
+            info = {
+                "subtrain_sharpe": subtrain_sharpe,
+                "val_sharpe": val_sharpe,
+                "selection_score": float(val_sharpe - float(overfit_penalty) * abs(subtrain_sharpe - val_sharpe)),
+            }
+            selection_source = "template_summary_anchor"
+        else:
+            best_combo, info = select_best_triple_ema_combo(
+                subtrain_close=subtrain_close,
+                validation_close=validation_close,
+                combos=combos,
+                validation_shortlist=validation_shortlist,
+                overfit_penalty=overfit_penalty,
+                fee_rate=fee_rate,
+                slippage_rate=slippage_rate,
+                shift_by=shift_by,
+                annualization=annualization,
+                require_strict_order=require_strict_order,
+                min_gap=min_gap,
+                signal_logic_mode=signal_logic_mode,
+                risk_free_rate=risk_free_rate,
+            )
 
         train_out[col] = build_strategy_returns_for_triple_ema_combo(
             train_close,
@@ -397,10 +451,25 @@ def build_train_test_strategy_returns_by_asset(
                 "subtrain_sharpe": float(info["subtrain_sharpe"]),
                 "val_sharpe": float(info["val_sharpe"]),
                 "selection_score": float(info["selection_score"]),
+                "selection_source": selection_source,
             }
         )
 
     selection_df = pd.DataFrame(selections)
+    if not selection_df.empty:
+        selection_df = selection_df.sort_values("asset").reset_index(drop=True)
+    if skipped_assets:
+        skipped_df = pd.DataFrame(skipped_assets)
+        skipped_df["ema1_period"] = np.nan
+        skipped_df["ema2_period"] = np.nan
+        skipped_df["ema3_period"] = np.nan
+        skipped_df["split_idx"] = np.nan
+        skipped_df["subtrain_sharpe"] = np.nan
+        skipped_df["val_sharpe"] = np.nan
+        skipped_df["selection_score"] = np.nan
+        selection_df = pd.concat([selection_df, skipped_df], ignore_index=True, sort=False)
+    if selection_df.empty:
+        raise ValueError("No assets with sufficient dense train/test rows for template strategy-return selection")
     return train_out, test_out, selection_df
 
 

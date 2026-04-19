@@ -10,6 +10,16 @@ from .stress import compute_scenario_metrics, evaluate_stress_scenarios, histori
 from .ml import score_regime_probabilities, score_rf_probabilities, threshold_probabilities, compute_position_scalars
 from .portfolio import allocate_portfolio_weights, PortfolioAllocationResult, hrp_allocation_hook, nco_allocation_hook
 from .backtest import run_return_equity_simulation, compute_backtest_metrics, build_weight_schedule_from_signals, BacktestResult
+from .external import (
+    ExternalProxyLoadResult,
+    load_proxy_from_csv,
+    load_proxy_from_stub,
+    load_proxy_adapter,
+    load_macro_proxy_adapter,
+    load_calendar_proxy_adapter,
+    load_liquidity_proxy_adapter,
+    load_cle_external_proxies,
+)
 
 __all__ = [
     "BacktestConfig",
@@ -44,4 +54,12 @@ __all__ = [
     "compute_backtest_metrics",
     "build_weight_schedule_from_signals",
     "BacktestResult",
+    "ExternalProxyLoadResult",
+    "load_proxy_from_csv",
+    "load_proxy_from_stub",
+    "load_proxy_adapter",
+    "load_macro_proxy_adapter",
+    "load_calendar_proxy_adapter",
+    "load_liquidity_proxy_adapter",
+    "load_cle_external_proxies",
 ]

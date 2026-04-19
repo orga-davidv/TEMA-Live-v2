@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import itertools
+from dataclasses import replace
 from typing import Dict, Tuple, Optional
 
 import numpy as np
@@ -279,6 +281,222 @@ def apply_hmm_softprob_rf_strategy(
         }
     )
     return ml_train, ml_test, diag, hmm_df, extras
+
+
+def _overlay_tuning_sharpe(series: pd.Series, *, freq: str, risk_free_rate: float = 0.0) -> float:
+    r = series.fillna(0.0).to_numpy(dtype=float)
+    if r.size < 2:
+        return float("-inf")
+    std = float(np.std(r, ddof=0))
+    if std <= 1e-12 or not np.isfinite(std):
+        return float("-inf")
+    ann = periods_per_year(freq)
+    mean = float(np.mean(r))
+    return float(((mean * ann) - float(risk_free_rate)) / (std * np.sqrt(ann)))
+
+
+def _build_time_ordered_validation_folds(
+    *,
+    n_rows: int,
+    min_rows: int,
+    validation_ratio: float,
+    requested_folds: int,
+) -> list[tuple[int, int, int]]:
+    """Return (fold_idx, split_idx, end_idx) for forward-only validation."""
+    n = int(n_rows)
+    min_r = max(int(min_rows), 1)
+    if n < (2 * min_r):
+        return []
+
+    val_rows = max(min_r, int(round(float(n) * float(validation_ratio))))
+    if val_rows >= n:
+        val_rows = max(min_r, n - min_r)
+    if val_rows <= 0:
+        return []
+
+    max_folds = max(1, (n - min_r) // val_rows)
+    folds = max(1, min(int(requested_folds), max_folds))
+
+    start = n - (folds * val_rows)
+    if start < min_r:
+        start = min_r
+        val_rows = max(min_r, (n - start) // folds)
+        if val_rows <= 0:
+            return []
+
+    out: list[tuple[int, int, int]] = []
+    for fold_idx in range(folds):
+        split_idx = start + fold_idx * val_rows
+        end_idx = split_idx + val_rows
+        if fold_idx == folds - 1:
+            end_idx = n
+        if split_idx < min_r:
+            continue
+        if end_idx - split_idx < min_r:
+            continue
+        out.append((fold_idx, int(split_idx), int(min(end_idx, n))))
+    return out
+
+
+def select_computed_overlay_cfg(
+    *,
+    train_port_rets: pd.Series,
+    cfg: BacktestConfig,
+    hmm_engine,
+) -> tuple[BacktestConfig, dict]:
+    computed_mode = not bool(getattr(cfg, "template_use_precomputed_artifacts", True))
+    if not computed_mode:
+        return cfg, {"applied": False, "reason": "precomputed_mode"}
+    if not bool(getattr(cfg, "ml_computed_overlay_tuning_enabled", True)):
+        return cfg, {"applied": False, "reason": "tuning_disabled"}
+
+    train = train_port_rets.fillna(0.0)
+    n = len(train)
+    min_rows = max(int(getattr(cfg, "ml_computed_overlay_tuning_min_rows", 80)), 20)
+    if n < (2 * min_rows):
+        return cfg, {"applied": False, "reason": "insufficient_rows", "rows": int(n)}
+
+    val_ratio = float(np.clip(getattr(cfg, "ml_computed_overlay_tuning_validation_ratio", 0.25), 0.10, 0.50))
+    folds_requested = int(getattr(cfg, "ml_computed_overlay_tuning_folds", 3))
+    overfit_penalty = float(max(getattr(cfg, "ml_computed_overlay_tuning_overfit_penalty", 0.5), 0.0))
+    fold_slices = _build_time_ordered_validation_folds(
+        n_rows=n,
+        min_rows=min_rows,
+        validation_ratio=val_ratio,
+        requested_folds=folds_requested,
+    )
+    if not fold_slices:
+        return cfg, {"applied": False, "reason": "insufficient_rows", "rows": int(n)}
+
+    grid_rf_n_estimators = tuple(int(x) for x in getattr(cfg, "ml_computed_overlay_grid_rf_n_estimators", (cfg.rf_n_estimators,)))
+    grid_rf_max_depth = tuple(int(x) for x in getattr(cfg, "ml_computed_overlay_grid_rf_max_depth", (cfg.rf_max_depth,)))
+    grid_rf_min_leaf = tuple(int(x) for x in getattr(cfg, "ml_computed_overlay_grid_rf_min_samples_leaf", (cfg.rf_min_samples_leaf,)))
+    grid_target_exposure = tuple(float(x) for x in getattr(cfg, "ml_computed_overlay_grid_target_exposure", (cfg.ml_target_exposure,)))
+    grid_hmm_states = tuple(int(x) for x in getattr(cfg, "ml_computed_overlay_grid_hmm_n_states", (cfg.hmm_n_states,)))
+    candidates = list(itertools.product(grid_rf_n_estimators, grid_rf_max_depth, grid_rf_min_leaf, grid_target_exposure, grid_hmm_states))
+
+    rows: list[dict] = []
+    for n_est, depth, min_leaf, target_exp, n_states in candidates:
+        local_cfg = replace(
+            cfg,
+            rf_n_estimators=int(n_est),
+            rf_max_depth=int(depth),
+            rf_min_samples_leaf=int(min_leaf),
+            ml_target_exposure=float(target_exp),
+            hmm_n_states=int(n_states),
+            ml_auto_threshold=True,
+        )
+        try:
+            fold_scores: list[float] = []
+            fold_val_sharpes: list[float] = []
+            fold_subtrain_sharpes: list[float] = []
+            fold_exposure_penalties: list[float] = []
+            for _fold_idx, split_idx, end_idx in fold_slices:
+                subtrain = train.iloc[:split_idx].copy()
+                val = train.iloc[split_idx:end_idx].copy()
+                ml_subtrain, ml_val, diag, _hmm_df, _extras = apply_hmm_softprob_rf_strategy(
+                    train_port_rets=subtrain,
+                    test_port_rets=val,
+                    cfg=local_cfg,
+                    hmm_engine=hmm_engine,
+                )
+                subtrain_sharpe = _overlay_tuning_sharpe(
+                    ml_subtrain,
+                    freq=cfg.freq,
+                    risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
+                )
+                val_sharpe = _overlay_tuning_sharpe(
+                    ml_val,
+                    freq=cfg.freq,
+                    risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
+                )
+                if not np.isfinite(subtrain_sharpe) or not np.isfinite(val_sharpe):
+                    continue
+                exposure_realized = float(diag.get("test_avg_exposure", np.nan))
+                exposure_penalty = abs(exposure_realized - float(target_exp)) if np.isfinite(exposure_realized) else 1.0
+                score = float(val_sharpe - overfit_penalty * abs(subtrain_sharpe - val_sharpe) - exposure_penalty)
+                fold_scores.append(float(score))
+                fold_val_sharpes.append(float(val_sharpe))
+                fold_subtrain_sharpes.append(float(subtrain_sharpe))
+                fold_exposure_penalties.append(float(exposure_penalty))
+
+            if not fold_scores:
+                raise RuntimeError("no_valid_folds")
+
+            rows.append(
+                {
+                    "score": float(np.mean(fold_scores)),
+                    "score_std": float(np.std(fold_scores)),
+                    "sharpe": float(np.mean(fold_val_sharpes)),
+                    "subtrain_sharpe": float(np.mean(fold_subtrain_sharpes)),
+                    "overfit_gap": float(np.mean(np.abs(np.asarray(fold_subtrain_sharpes) - np.asarray(fold_val_sharpes)))),
+                    "avg_exposure_penalty": float(np.mean(fold_exposure_penalties)),
+                    "folds_evaluated": int(len(fold_scores)),
+                    "rf_n_estimators": int(n_est),
+                    "rf_max_depth": int(depth),
+                    "rf_min_samples_leaf": int(min_leaf),
+                    "ml_target_exposure": float(target_exp),
+                    "hmm_n_states": int(n_states),
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "score": float("-inf"),
+                    "error": str(exc),
+                    "rf_n_estimators": int(n_est),
+                    "rf_max_depth": int(depth),
+                    "rf_min_samples_leaf": int(min_leaf),
+                    "ml_target_exposure": float(target_exp),
+                    "hmm_n_states": int(n_states),
+                }
+            )
+
+    valid = [r for r in rows if np.isfinite(float(r.get("score", float("-inf"))))]
+    if not valid:
+        return cfg, {"applied": False, "reason": "no_valid_candidate", "candidate_count": len(candidates)}
+
+    best = max(
+        valid,
+        key=lambda item: (
+            float(item.get("score", float("-inf"))),
+            float(item.get("sharpe", float("-inf"))),
+            -float(item.get("score_std", float("inf"))),
+            -float(item.get("overfit_gap", float("inf"))),
+            -int(item["rf_max_depth"]),
+            int(item["rf_min_samples_leaf"]),
+            -float(item["ml_target_exposure"]),
+            -int(item["hmm_n_states"]),
+            -int(item["rf_n_estimators"]),
+        ),
+    )
+    selected_cfg = replace(
+        cfg,
+        rf_n_estimators=int(best["rf_n_estimators"]),
+        rf_max_depth=int(best["rf_max_depth"]),
+        rf_min_samples_leaf=int(best["rf_min_samples_leaf"]),
+        ml_target_exposure=float(best["ml_target_exposure"]),
+        hmm_n_states=int(best["hmm_n_states"]),
+        ml_auto_threshold=True,
+    )
+
+    return selected_cfg, {
+        "applied": True,
+        "candidate_count": int(len(candidates)),
+        "validation_folds": int(len(fold_slices)),
+        "split_rows_subtrain": int(fold_slices[-1][1]),
+        "split_rows_validation": int(fold_slices[-1][2] - fold_slices[-1][1]),
+        "selection_score": float(best["score"]),
+        "selection_sharpe": float(best["sharpe"]),
+        "selection_score_std": float(best.get("score_std", 0.0)),
+        "selection_subtrain_sharpe": float(best.get("subtrain_sharpe", 0.0)),
+        "selection_overfit_gap": float(best.get("overfit_gap", 0.0)),
+        "selected_rf_n_estimators": int(best["rf_n_estimators"]),
+        "selected_rf_max_depth": int(best["rf_max_depth"]),
+        "selected_rf_min_samples_leaf": int(best["rf_min_samples_leaf"]),
+        "selected_ml_target_exposure": float(best["ml_target_exposure"]),
+        "selected_hmm_n_states": int(best["hmm_n_states"]),
+    }
 
 
 def compute_and_apply_ml_position_scalar(
@@ -584,10 +802,17 @@ def compute_template_ml_overlay(
     ml_diag: Dict[str, float] = {}
     hmm_state_df = pd.DataFrame()
     ml_series: Dict[str, object] = {}
+    ml_tuning_diag: dict = {"applied": False}
 
     selected_cfg = cfg
     if bool(getattr(cfg, "ml_enabled", False)):
         hmm_engine = hmm_engine or get_hmm_engine(prefer_cpp=True)
+        if not bool(getattr(cfg, "template_use_precomputed_artifacts", True)):
+            selected_cfg, ml_tuning_diag = select_computed_overlay_cfg(
+                train_port_rets=train_port_rets,
+                cfg=cfg,
+                hmm_engine=hmm_engine,
+            )
         ml_train_rets, ml_test_rets, ml_diag, hmm_state_df, ml_series = apply_hmm_softprob_rf_strategy(
             train_port_rets=train_port_rets,
             test_port_rets=test_port_rets,
@@ -639,6 +864,7 @@ def compute_template_ml_overlay(
         "ml_train_metrics": ml_train_metrics,
         "ml_test_metrics": ml_test_metrics,
         "ml_diagnostics": ml_diag,
+        "ml_tuning_diagnostics": ml_tuning_diag,
         "ml_position_scalar_diagnostics": ml_pos_diag,
         "vol_target_diagnostics": vol_diag,
         "hmm_state_params": hmm_state_df.to_dict(orient="list") if not hmm_state_df.empty else {},

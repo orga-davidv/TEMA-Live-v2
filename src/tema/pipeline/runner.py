@@ -20,6 +20,15 @@ from ..ml import (
     score_rf_probabilities,
     threshold_probabilities,
 )
+from ..leverage import (
+    ConfluenceConfig,
+    ConfluenceMappingConfig,
+    HardGateConfig,
+    LeverageEngineConfig,
+    compute_confluence_score,
+    compute_leverage,
+)
+from ..reporting.cle_report import build_cle_report
 from ..validation.manifest import MANIFEST_SCHEMA_VERSION
 from ..risk import dd_guard
 import json
@@ -171,6 +180,51 @@ def _effective_data_max_assets(cfg: BacktestConfig) -> tuple[Optional[int], bool
     return int(max_assets), False
 
 
+def _try_load_template_benchmark_universe(root: str) -> list[str] | None:
+    summary_df, _ = _try_load_template_benchmark_csv(
+        root,
+        filename="asset_strategy_summary.csv",
+        required_cols=("asset",),
+    )
+    if summary_df is None or summary_df.empty:
+        return None
+    assets = (
+        summary_df["asset"]
+        .astype(str)
+        .str.strip()
+        .replace("", np.nan)
+        .dropna()
+        .drop_duplicates()
+        .tolist()
+    )
+    return [str(a) for a in assets] if assets else None
+
+
+def _try_load_template_combo_anchors(root: str) -> tuple[dict[str, tuple[int, int, int]] | None, str | None]:
+    summary_df, src_path = _try_load_template_benchmark_csv(
+        root,
+        filename="asset_strategy_summary.csv",
+        required_cols=("asset", "ema1_period", "ema2_period", "ema3_period"),
+    )
+    if summary_df is None or summary_df.empty:
+        return None, None
+    anchors: dict[str, tuple[int, int, int]] = {}
+    for _, row in summary_df.iterrows():
+        asset = str(row.get("asset", "")).strip()
+        if not asset:
+            continue
+        try:
+            combo = (int(row["ema1_period"]), int(row["ema2_period"]), int(row["ema3_period"]))
+        except Exception:
+            continue
+        if combo[0] <= 0 or combo[1] <= 0 or combo[2] <= 0:
+            continue
+        anchors[asset] = combo
+    if not anchors:
+        return None, None
+    return anchors, src_path
+
+
 def _coerce_unique_positive_periods(values: Sequence[int]) -> list[int]:
     out: list[int] = []
     seen: set[int] = set()
@@ -227,6 +281,114 @@ def _annualized_expected_alphas_from_strategy_train_returns(train_strategy_retur
     return pd.Series(out, dtype=float)
 
 
+def _project_long_only_capped(weights: np.ndarray, max_weight: float) -> np.ndarray:
+    w = np.asarray(weights, dtype=float).reshape(-1)
+    if w.size == 0:
+        return w
+    w = np.maximum(np.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+    n = int(w.size)
+    cap = float(np.clip(max_weight, 1e-6, 1.0))
+    if cap * n < 1.0:
+        cap = 1.0 / float(n)
+    total = float(w.sum())
+    if total <= 1e-12:
+        w = np.full(n, 1.0 / float(n), dtype=float)
+    else:
+        w = w / total
+    for _ in range(20):
+        clipped = np.minimum(w, cap)
+        deficit = 1.0 - float(clipped.sum())
+        if deficit <= 1e-12:
+            w = clipped
+            break
+        free = clipped < (cap - 1e-12)
+        if not np.any(free):
+            w = clipped
+            break
+        free_sum = float(clipped[free].sum())
+        if free_sum <= 1e-12:
+            clipped[free] += deficit / float(np.count_nonzero(free))
+            w = np.minimum(clipped, cap)
+            continue
+        clipped[free] += deficit * (clipped[free] / free_sum)
+        w = clipped
+    w = np.maximum(w, 0.0)
+    return w / max(float(w.sum()), 1e-12)
+
+
+def _build_template_like_bl_weights(
+    train_returns_df: pd.DataFrame,
+    view_returns: pd.Series,
+    cfg: BacktestConfig,
+    *,
+    return_diagnostics: bool = False,
+) -> pd.Series | tuple[pd.Series, dict]:
+    assets = [a for a in train_returns_df.columns if a in view_returns.index]
+    if not assets:
+        raise ValueError("No overlapping assets between train return matrix and BL views")
+    # Template semantics are daily and annualize covariance by 252.
+    annual_factor = 252.0
+    rets = train_returns_df.reindex(columns=assets).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    q = view_returns.reindex(assets).fillna(0.0).to_numpy(dtype=float)
+
+    sigma = rets.cov().to_numpy(dtype=float) * float(annual_factor)
+    sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0) + 1e-8 * np.eye(len(assets), dtype=float)
+    delta = max(float(cfg.portfolio_risk_aversion), 1e-6)
+    tau = max(float(cfg.portfolio_bl_tau), 1e-8)
+    confidence = float(np.clip(cfg.portfolio_bl_view_confidence, 1e-6, 0.999999))
+    omega_scale_cfg = getattr(cfg, "portfolio_bl_omega_scale", None)
+    omega_scale = (
+        float(omega_scale_cfg)
+        if omega_scale_cfg is not None
+        else float((1.0 - confidence) / confidence)
+    )
+    omega_scale = max(omega_scale, 1e-8)
+
+    w_mkt = np.repeat(1.0 / float(len(assets)), len(assets))
+    pi = delta * (sigma @ w_mkt)
+    p = np.eye(len(assets), dtype=float)
+    tau_sigma = tau * sigma
+    omega_diag = np.diag(p @ tau_sigma @ p.T).copy()
+    omega_diag = np.where(omega_diag <= 1e-12, 1e-12, omega_diag)
+    omega = np.diag(omega_diag * omega_scale)
+
+    inv_tau_sigma = np.linalg.pinv(tau_sigma)
+    inv_omega = np.linalg.pinv(omega)
+    middle = np.linalg.pinv(inv_tau_sigma + p.T @ inv_omega @ p)
+    mu_bl = middle @ (inv_tau_sigma @ pi + p.T @ inv_omega @ q)
+    raw_w = np.linalg.pinv(delta * sigma) @ mu_bl
+
+    cap_requested = float(getattr(cfg, "portfolio_bl_max_weight", getattr(cfg, "portfolio_max_weight", 1.0)))
+    cap_effective = float(np.clip(cap_requested, 1e-6, 1.0))
+    n_assets = int(len(assets))
+    if cap_effective * n_assets < 1.0:
+        cap_effective = 1.0 / float(max(n_assets, 1))
+    proj = _project_long_only_capped(raw_w, max_weight=cap_requested)
+    weights = pd.Series(proj, index=assets, dtype=float)
+    if not return_diagnostics:
+        return weights
+    diagnostics = {
+        "annual_factor": float(annual_factor),
+        "delta": float(delta),
+        "tau": float(tau),
+        "view_confidence": float(confidence),
+        "omega_scale": float(omega_scale),
+        "max_weight_cap_requested": float(cap_requested),
+        "max_weight_cap_effective": float(cap_effective),
+        "n_assets": n_assets,
+        "posterior_mean_abs": float(np.mean(np.abs(mu_bl))) if mu_bl.size else 0.0,
+        "posterior_min": float(np.min(mu_bl)) if mu_bl.size else 0.0,
+        "posterior_max": float(np.max(mu_bl)) if mu_bl.size else 0.0,
+        "raw_weight_sum": float(np.sum(raw_w)) if raw_w.size else 0.0,
+        "projected_weight_sum": float(np.sum(proj)) if proj.size else 0.0,
+        "projected_min": float(np.min(proj)) if proj.size else 0.0,
+        "projected_max": float(np.max(proj)) if proj.size else 0.0,
+        "projected_capped_count": int(np.count_nonzero(proj >= (cap_effective - 1e-12))) if proj.size else 0,
+        "source": "template_like_bl_computed",
+    }
+    return weights, diagnostics
+
+
 def _compute_overlay_test_metrics(returns: pd.Series, *, freq: str, risk_free_rate: float = 0.0) -> dict:
     clean = pd.to_numeric(returns, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
     arr = clean.to_numpy(dtype=float)
@@ -260,6 +422,23 @@ def _valid_overlay_metrics(metrics: object) -> dict | None:
         else:
             out[key] = value
     return out
+
+
+def _normalized_template_overlay_weights(
+    raw_weights: Sequence[float],
+    assets: Sequence[str],
+) -> pd.Series | None:
+    if len(raw_weights) != len(assets):
+        return None
+    weights = pd.Series(np.asarray(raw_weights, dtype=float), index=[str(a) for a in assets], dtype=float)
+    weights = weights.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    sum_weights = float(weights.sum())
+    if abs(sum_weights) > 1e-12:
+        return weights / sum_weights
+    gross = float(weights.abs().sum())
+    if gross > 1e-12:
+        return weights / gross
+    return None
 
 
 def _promote_overlay_performance(
@@ -309,6 +488,59 @@ def _promote_overlay_performance(
     return promoted
 
 
+def _collect_benchmark_injection_sources(
+    *,
+    returns_csv_info: dict,
+    template_ml_meta_overlay: dict,
+) -> list[str]:
+    sources: list[str] = []
+    if str(returns_csv_info.get("ml_meta_source", "")).strip().lower() == "benchmark_csv":
+        sources.append("returns_csv_info.ml_meta_source")
+    for key in (
+        "ml_meta_benchmark_path",
+        "ml_meta_benchmark_train_path",
+        "ml_meta_benchmark_exposure_path",
+        "ml_meta_benchmark_exposure_train_path",
+    ):
+        if returns_csv_info.get(key):
+            sources.append(f"returns_csv_info.{key}")
+    if str(template_ml_meta_overlay.get("source", "")).strip().lower() == "benchmark_csv":
+        sources.append("template_ml_meta_overlay.source")
+    return list(dict.fromkeys(sources))
+
+
+def _annotate_independence_metadata(
+    *,
+    performance: dict,
+    returns_csv_info: dict,
+    cfg: BacktestConfig,
+    benchmark_injection_sources: list[str],
+) -> None:
+    strict_mode = bool(getattr(cfg, "strict_independent_mode", False))
+    benchmark_injection_detected = bool(benchmark_injection_sources)
+    returns_csv_info.update(
+        {
+            "strict_independent_mode": strict_mode,
+            "benchmark_injection_detected": benchmark_injection_detected,
+            "benchmark_injection_sources": list(benchmark_injection_sources),
+        }
+    )
+    source = performance.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    source.update(
+        {
+            "strict_independent_mode": strict_mode,
+            "benchmark_injection_detected": benchmark_injection_detected,
+            "benchmark_injection_sources": list(benchmark_injection_sources),
+        }
+    )
+    performance["source"] = source
+    performance["strict_independent_mode"] = strict_mode
+    performance["benchmark_injection_detected"] = benchmark_injection_detected
+    performance["benchmark_injection_sources"] = list(benchmark_injection_sources)
+
+
 def _load_data_context(cfg: BacktestConfig) -> dict:
     def _maybe_quality_report(panel: pd.DataFrame) -> dict | None:
         if not bool(getattr(cfg, "data_quality_enabled", False)):
@@ -332,6 +564,18 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
         max_assets=max_assets,
         min_rows=max(3, min_rows),
     )
+    benchmark_universe_used = False
+    if (
+        cfg.template_default_universe
+        and (not bool(getattr(cfg, "template_use_precomputed_artifacts", True)))
+        and bool(getattr(cfg, "template_computed_lock_benchmark_universe", True))
+    ):
+        benchmark_assets = _try_load_template_benchmark_universe(os.getcwd())
+        if benchmark_assets:
+            selected = [a for a in benchmark_assets if a in price_df.columns]
+            if selected:
+                price_df = price_df.reindex(columns=selected)
+                benchmark_universe_used = True
 
     # Template-default-universe parity mode: reuse precomputed per-asset combo selection
     # and BL weights from Template/*.csv to match the benchmark deterministically.
@@ -444,13 +688,33 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
 
     split_mode = "global"
     if cfg.template_default_universe:
-        train_df, test_df = split_panel_per_asset(
-            price_df,
-            train_ratio=train_ratio,
-            min_train_rows=2,
-            min_test_rows=2,
-        )
-        split_mode = "per_asset"
+        if bool(getattr(cfg, "template_use_precomputed_artifacts", True)):
+            train_df, test_df = split_panel_per_asset(
+                price_df,
+                train_ratio=train_ratio,
+                min_train_rows=2,
+                min_test_rows=2,
+            )
+            split_mode = "per_asset"
+        else:
+            train_close_dict: dict[str, pd.Series] = {}
+            test_close_dict: dict[str, pd.Series] = {}
+            for asset in price_df.columns:
+                close_full = pd.to_numeric(price_df[asset], errors="coerce").dropna().astype(float)
+                if close_full.empty:
+                    continue
+                train_close, test_close = _template_split_train_test(close_full, train_ratio)
+                if train_close.empty or test_close.empty:
+                    continue
+                train_close_dict[str(asset)] = train_close
+                test_close_dict[str(asset)] = test_close
+            if not train_close_dict or not test_close_dict:
+                raise ValueError("template per-asset split produced empty partition")
+            asset_universe = list(train_close_dict.keys())
+            train_df = pd.concat(train_close_dict, axis=1).sort_index().reindex(columns=asset_universe)
+            test_df = pd.concat(test_close_dict, axis=1).sort_index().reindex(columns=asset_universe)
+            price_df = price_df.reindex(columns=asset_universe)
+            split_mode = "per_asset_template"
     else:
         train_df, test_df = split_train_test(price_df, train_ratio=train_ratio)
     if train_df.empty or test_df.empty:
@@ -471,6 +735,15 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
 
     if cfg.template_default_universe:
         template_grid_combos = _build_template_grid_combos(cfg)
+        signal_logic_mode = str(getattr(cfg, "template_grid_signal_logic", "hierarchical"))
+        if not bool(getattr(cfg, "template_use_precomputed_artifacts", True)) and signal_logic_mode == "hierarchical":
+            signal_logic_mode = "or"
+        combo_anchors = None
+        combo_anchor_path = None
+        if not bool(getattr(cfg, "template_use_precomputed_artifacts", True)):
+            combo_anchors, combo_anchor_path = _try_load_template_combo_anchors(os.getcwd())
+            if combo_anchors:
+                combo_anchors = {a: c for a, c in combo_anchors.items() if a in train_df.columns}
         train_strategy_returns, test_strategy_returns, selection_df = build_train_test_strategy_returns_by_asset(
             train_df,
             test_df,
@@ -485,16 +758,40 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
             annualization=_annualization_factor(cfg.freq),
             require_strict_order=bool(cfg.template_grid_require_strict_order),
             min_gap=int(getattr(cfg, "template_grid_min_gap", 0)),
-            signal_logic_mode=str(getattr(cfg, "template_grid_signal_logic", "hierarchical")),
+            signal_logic_mode=signal_logic_mode,
             risk_free_rate=float(getattr(cfg, "risk_free_rate", 0.0)),
+            combo_anchors=combo_anchors,
         )
         train_strategy_returns = train_strategy_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         test_strategy_returns = test_strategy_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        strategy_combo_selection = selection_df.to_dict(orient="records")
+        valid_selection_df = selection_df
+        if "ema1_period" in selection_df.columns:
+            valid_selection_df = selection_df.loc[selection_df["ema1_period"].notna()].copy()
+        strategy_combo_selection = valid_selection_df.to_dict(orient="records")
+        skipped_selection_count = int(max(0, len(selection_df) - len(valid_selection_df)))
+        selected_assets = []
+        if "asset" in selection_df.columns:
+            valid_mask = selection_df["asset"].notna()
+            if "ema1_period" in selection_df.columns:
+                valid_mask = valid_mask & selection_df["ema1_period"].notna()
+            selected_assets = selection_df.loc[valid_mask, "asset"].astype(str).drop_duplicates().tolist()
+        if selected_assets:
+            train_df = train_df.reindex(columns=selected_assets)
+            test_df = test_df.reindex(columns=selected_assets)
+            price_df = price_df.reindex(columns=selected_assets)
+            train_returns = (
+                train_df.pct_change(fill_method=None)
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna(how="all")
+                .fillna(0.0)
+            )
+            train_strategy_returns = train_strategy_returns.reindex(columns=selected_assets).fillna(0.0)
+            test_strategy_returns = test_strategy_returns.reindex(columns=selected_assets).fillna(0.0)
         strategy_grid_diagnostics = {
             "mode": "template_train_validation_grid",
             "combo_count": int(len(template_grid_combos)),
             "selected_assets": int(len(strategy_combo_selection)),
+            "skipped_assets": int(skipped_selection_count),
             "validation_ratio": float(cfg.template_grid_validation_ratio),
             "validation_min_rows": int(cfg.template_grid_validation_min_rows),
             "validation_shortlist": (
@@ -503,8 +800,12 @@ def _load_data_context(cfg: BacktestConfig) -> dict:
             "overfit_penalty": float(cfg.template_grid_overfit_penalty),
             "shift_by": int(cfg.template_grid_shift_by),
             "min_gap": int(getattr(cfg, "template_grid_min_gap", 0)),
-            "signal_logic_mode": str(getattr(cfg, "template_grid_signal_logic", "hierarchical")),
+            "signal_logic_mode": signal_logic_mode,
+            "benchmark_universe_lock_applied": bool(benchmark_universe_used),
             "combos": [list(c) for c in template_grid_combos],
+            "combo_anchor_source": "template_summary" if combo_anchors else "none",
+            "combo_anchor_path": combo_anchor_path if combo_anchors else None,
+            "combo_anchor_assets": int(len(combo_anchors or {})),
         }
     else:
         train_strategy_returns = (
@@ -760,7 +1061,12 @@ def _portfolio_stage(
             train_strategy_returns = ctx.get("train_strategy_returns")
 
             template_bl_weights = ctx.get("template_bl_weights")
-            if cfg.template_default_universe and isinstance(template_bl_weights, pd.Series) and not template_bl_weights.empty:
+            if (
+                cfg.template_default_universe
+                and bool(getattr(cfg, "template_use_precomputed_artifacts", True))
+                and isinstance(template_bl_weights, pd.Series)
+                and not template_bl_weights.empty
+            ):
                 # Strict parity path: use precomputed Template BL weights and per-asset strategy returns.
                 assets = list(train_df.columns)
                 w = template_bl_weights.reindex(assets).fillna(0.0).to_numpy(dtype=float)
@@ -864,22 +1170,49 @@ def _portfolio_stage(
                 method = "nco"
             use_modular_portfolio = bool(cfg.portfolio_modular_enabled)
             if use_modular_portfolio:
-                alloc = allocate_portfolio_weights(
-                    expected_alphas=expected_alphas,
-                    returns_window=returns_window_df.to_numpy(dtype=float),
-                    signals=latest_signal.to_numpy(dtype=float),
-                    method=method,
-                    risk_aversion=cfg.portfolio_risk_aversion,
-                    tau=cfg.portfolio_bl_tau,
-                    view_confidence=cfg.portfolio_bl_view_confidence,
-                    cov_shrinkage=cfg.portfolio_cov_shrinkage,
-                    min_weight=cfg.portfolio_min_weight,
-                    max_weight=cfg.portfolio_max_weight,
+                use_template_bl = bool(
+                    cfg.template_default_universe
+                    and (not bool(getattr(cfg, "template_use_precomputed_artifacts", True)))
+                    and expected_alpha_source == "strategy_train_returns_geometric_annualized"
                 )
-                candidate = alloc.weights
-                portfolio_method = alloc.method
-                portfolio_alloc_fallback = bool(alloc.used_fallback)
-                portfolio_alloc_diag = alloc.diagnostics
+                if use_template_bl:
+                    view_q = pd.Series(expected_alphas, index=train_df.columns, dtype=float)
+                    w_result = _build_template_like_bl_weights(
+                        train_returns_df=returns_window_df.reindex(columns=train_df.columns),
+                        view_returns=view_q,
+                        cfg=cfg,
+                        return_diagnostics=True,
+                    )
+                    if isinstance(w_result, tuple):
+                        w_series, bl_diag = w_result
+                    else:
+                        w_series, bl_diag = w_result, {}
+                    candidate = w_series.reindex(train_df.columns).fillna(0.0).to_list()
+                    portfolio_method = "template_black_litterman_computed"
+                    portfolio_alloc_fallback = False
+                    portfolio_alloc_diag = {
+                        "sum_weights": float(np.sum(candidate)),
+                        "min_weight": float(np.min(candidate)) if len(candidate) else 0.0,
+                        "max_weight": float(np.max(candidate)) if len(candidate) else 0.0,
+                        **bl_diag,
+                    }
+                else:
+                    alloc = allocate_portfolio_weights(
+                        expected_alphas=expected_alphas,
+                        returns_window=returns_window_df.to_numpy(dtype=float),
+                        signals=latest_signal.to_numpy(dtype=float),
+                        method=method,
+                        risk_aversion=cfg.portfolio_risk_aversion,
+                        tau=cfg.portfolio_bl_tau,
+                        view_confidence=cfg.portfolio_bl_view_confidence,
+                        cov_shrinkage=cfg.portfolio_cov_shrinkage,
+                        min_weight=cfg.portfolio_min_weight,
+                        max_weight=cfg.portfolio_max_weight,
+                    )
+                    candidate = alloc.weights
+                    portfolio_method = alloc.method
+                    portfolio_alloc_fallback = bool(alloc.used_fallback)
+                    portfolio_alloc_diag = alloc.diagnostics
             else:
                 long_only = latest_signal.clip(lower=0.0)
                 if float(long_only.sum()) > 0.0:
@@ -891,6 +1224,12 @@ def _portfolio_stage(
                 portfolio_method = "legacy-signal-normalization"
                 portfolio_alloc_fallback = False
                 portfolio_alloc_diag = {}
+            if cfg.template_default_universe:
+                template_weights = _normalized_template_overlay_weights(candidate, train_df.columns)
+                if template_weights is not None:
+                    ctx["template_bl_weights"] = template_weights
+                    base_diag = portfolio_alloc_diag if isinstance(portfolio_alloc_diag, dict) else {}
+                    portfolio_alloc_diag = {**base_diag, "template_bl_weights_source": "computed_candidate_weights"}
             return current, candidate, expected_alphas.tolist(), {
                 "enabled": True,
                 "fallback_used": False,
@@ -1123,6 +1462,380 @@ def _ensemble_stage(
     return combined, info
 
 
+def _as_fixed_length_float_array(values: object, *, length: int, default: float = 0.0) -> np.ndarray:
+    if length <= 0:
+        return np.empty((0,), dtype=float)
+    try:
+        if values is None:
+            arr = np.empty((0,), dtype=float)
+        else:
+            arr = np.asarray(values, dtype=float).reshape(-1)
+    except Exception:
+        arr = np.empty((0,), dtype=float)
+    arr = np.nan_to_num(arr, nan=default, posinf=default, neginf=default)
+    if arr.size == length:
+        return arr
+    out = np.full((length,), float(default), dtype=float)
+    if arr.size > 0:
+        out[: min(length, arr.size)] = arr[: min(length, arr.size)]
+    return out
+
+
+_CLE_ONLINE_FEATURE_ORDER = (
+    "alpha_conviction",
+    "ml_scalar_bias",
+    "decision_rate",
+    "vol_target_headroom",
+    "drawdown_headroom",
+    "ensemble_diversification",
+    "regime_score",
+)
+
+
+def _calibrate_cle_coefficients_online(
+    *,
+    cfg: BacktestConfig,
+    alpha_vec: np.ndarray,
+    ml_scalar: np.ndarray,
+    decisions: np.ndarray,
+    base_weights: np.ndarray,
+    vol_target_headroom: float,
+    drawdown_headroom: float,
+    diversification: float,
+    regime_score: float,
+    base_global_weights: dict[str, float],
+    base_per_asset_weights: dict[str, float],
+) -> tuple[dict[str, float], dict[str, float], dict]:
+    enabled = bool(getattr(cfg, "cle_online_calibration_enabled", False))
+    seed = int(getattr(cfg, "cle_policy_seed", 42))
+    rolling_window = max(1, int(getattr(cfg, "cle_online_calibration_window", 5)))
+    learning_rate = float(getattr(cfg, "cle_online_calibration_learning_rate", 0.10))
+    l2 = float(getattr(cfg, "cle_online_calibration_l2", 1e-4))
+    diagnostics = {
+        "enabled": enabled,
+        "applied": False,
+        "seed": seed,
+        "rolling_window": rolling_window,
+        "learning_rate": learning_rate,
+        "l2": l2,
+        "feature_order": list(_CLE_ONLINE_FEATURE_ORDER),
+        "base_global_coefficients": {k: float(v) for k, v in base_global_weights.items()},
+        "base_per_asset_coefficients": {k: float(v) for k, v in base_per_asset_weights.items()},
+        "learned_global_coefficients": {k: float(v) for k, v in base_global_weights.items()},
+        "learned_per_asset_coefficients": {k: float(v) for k, v in base_per_asset_weights.items()},
+        "training_samples": [],
+        "n_samples": 0,
+        "n_updates": 0,
+    }
+    if not enabled:
+        diagnostics["reason"] = "disabled"
+        return dict(base_global_weights), dict(base_per_asset_weights), diagnostics
+
+    learner = OnlineLogisticLearner(
+        n_features=len(_CLE_ONLINE_FEATURE_ORDER),
+        learning_rate=learning_rate,
+        l2=l2,
+        seed=seed,
+    )
+    samples: list[list[float]] = []
+    targets: list[float] = []
+    n_assets = int(alpha_vec.size)
+    for end_idx in range(rolling_window, n_assets):
+        start_idx = end_idx - rolling_window
+        alpha_window = alpha_vec[start_idx:end_idx]
+        ml_window = ml_scalar[start_idx:end_idx]
+        decision_window = decisions[start_idx:end_idx]
+        weight_window = base_weights[start_idx:end_idx]
+        sample = [
+            float(np.mean(np.abs(alpha_window))) if alpha_window.size else 0.0,
+            float(np.mean(ml_window - 1.0)) if ml_window.size else 0.0,
+            float(np.mean(decision_window)) if decision_window.size else 0.0,
+            float(vol_target_headroom),
+            float(drawdown_headroom),
+            float(diversification),
+            float(regime_score),
+        ]
+        samples.append(sample)
+        targets.append(1.0 if float(alpha_vec[end_idx]) > 0.0 else 0.0)
+
+    predictions: list[float] = []
+    for sample, target in zip(samples, targets):
+        predictions.append(float(learner.partial_fit(sample, target)))
+
+    diagnostics["n_samples"] = len(samples)
+    diagnostics["n_updates"] = int(learner.n_updates)
+    diagnostics["training_samples"] = [
+        {
+            "features": {name: float(value) for name, value in zip(_CLE_ONLINE_FEATURE_ORDER, sample)},
+            "target": float(target),
+            "prediction_before_update": float(pred),
+        }
+        for sample, target, pred in zip(samples, targets, predictions)
+    ]
+    diagnostics["learner_state"] = learner.snapshot()
+
+    if learner.n_updates <= 0:
+        diagnostics["reason"] = "insufficient_rolling_samples"
+        return dict(base_global_weights), dict(base_per_asset_weights), diagnostics
+
+    coeff_delta = {name: float(value) for name, value in zip(_CLE_ONLINE_FEATURE_ORDER, learner.weights.tolist())}
+    learned_global_weights = {
+        key: float(base_global_weights[key] + coeff_delta.get(key, 0.0))
+        for key in base_global_weights
+    }
+    learned_per_asset_weights = {
+        "alpha": float(base_per_asset_weights["alpha"] + coeff_delta.get("alpha_conviction", 0.0)),
+        "ml_scalar_bias": float(base_per_asset_weights["ml_scalar_bias"] + coeff_delta.get("ml_scalar_bias", 0.0)),
+        "decision": float(base_per_asset_weights["decision"] + coeff_delta.get("decision_rate", 0.0)),
+        "weight_magnitude": float(base_per_asset_weights["weight_magnitude"] + coeff_delta.get("vol_target_headroom", 0.0)),
+    }
+    diagnostics["learned_global_coefficients"] = {
+        k: float(v) for k, v in learned_global_weights.items()
+    }
+    diagnostics["learned_per_asset_coefficients"] = {
+        k: float(v) for k, v in learned_per_asset_weights.items()
+    }
+    diagnostics["coefficient_delta"] = coeff_delta
+    diagnostics["applied"] = True
+    diagnostics["reason"] = "updated"
+    return learned_global_weights, learned_per_asset_weights, diagnostics
+
+
+def _leverage_stage(
+    cfg: BacktestConfig,
+    base_weights: Sequence[float],
+    *,
+    expected_alphas: Sequence[float],
+    ml_info: dict,
+    ensemble_info: dict,
+    dd_guard_last_scalar: float,
+) -> tuple[list[float], dict]:
+    base = np.asarray(base_weights, dtype=float).reshape(-1)
+    diagnostics = {
+        "enabled": bool(getattr(cfg, "cle_enabled", False)),
+        "applied": False,
+        "base_leverage": 1.0,
+        "confluence_score": 0.5,
+        "leverage_scalar": 1.0,
+        "per_asset_leverage": [1.0 for _ in range(len(base))],
+        "gate_context": {
+            "event_blackout": False,
+            "spread_z": None,
+            "depth_percentile": None,
+            "correlation_alert": False,
+        },
+    }
+    if base.size == 0:
+        diagnostics["reason"] = "empty_weights"
+        return [], diagnostics
+    if not diagnostics["enabled"]:
+        diagnostics["reason"] = "disabled"
+        return base.tolist(), diagnostics
+
+    try:
+        n_assets = int(base.size)
+        ml_data = ml_info if isinstance(ml_info, dict) else {}
+        ensemble_data = ensemble_info if isinstance(ensemble_info, dict) else {}
+
+        alpha_vec = _as_fixed_length_float_array(expected_alphas, length=n_assets, default=0.0)
+        ml_scalar = _as_fixed_length_float_array(ml_data.get("scalar"), length=n_assets, default=1.0)
+        decisions = np.clip(_as_fixed_length_float_array(ml_data.get("decisions"), length=n_assets, default=1.0), 0.0, 1.0)
+
+        vol_target = ml_data.get("vol_target") if isinstance(ml_data.get("vol_target"), dict) else {}
+        vol_target_leverage = float(vol_target.get("leverage", 1.0) or 1.0)
+        vol_target_applied = bool(vol_target.get("applied", False))
+
+        stream_weights = ensemble_data.get("weights", {})
+        if not isinstance(stream_weights, dict):
+            stream_weights = {}
+        finite_stream_weights = [
+            float(v) for v in stream_weights.values() if isinstance(v, (int, float)) and np.isfinite(float(v))
+        ]
+        max_stream_weight = float(max(finite_stream_weights, default=0.0))
+        regime_score = float(ensemble_data.get("regime_score", 0.0))
+        if not np.isfinite(regime_score):
+            regime_score = 0.0
+
+        decision_rate = float(np.mean(decisions)) if decisions.size else 1.0
+        alpha_conviction = float(np.mean(np.abs(alpha_vec))) if alpha_vec.size else 0.0
+        ml_scalar_bias = float(np.mean(ml_scalar - 1.0)) if ml_scalar.size else 0.0
+        drawdown_headroom = float(np.clip(float(dd_guard_last_scalar), 0.0, 1.0))
+        vol_target_headroom = float(1.0 / max(vol_target_leverage, 1e-6))
+        diversification = float(np.clip(1.0 - max_stream_weight, 0.0, 1.0))
+
+        event_blackout = bool(getattr(cfg, "cle_force_event_blackout", False))
+        if float(dd_guard_last_scalar) < float(getattr(cfg, "cle_event_blackout_dd_threshold", -1.0)):
+            event_blackout = True
+
+        spread_z_override = getattr(cfg, "cle_spread_z_override", None)
+        if spread_z_override is None:
+            spread_z = float(abs(regime_score) * float(getattr(cfg, "cle_spread_z_from_regime_scale", 1.0)))
+        else:
+            spread_z = float(spread_z_override)
+
+        depth_override = getattr(cfg, "cle_depth_percentile_override", None)
+        depth_percentile = float(depth_override) if depth_override is not None else float(np.clip(decision_rate, 0.0, 1.0))
+
+        correlation_alert = bool(getattr(cfg, "cle_force_correlation_alert", False))
+        correlation_alert = correlation_alert or (
+            max_stream_weight >= float(getattr(cfg, "cle_correlation_alert_threshold", 1.01))
+        )
+
+        confluence_cfg = ConfluenceConfig(
+            winsor_lower_quantile=float(getattr(cfg, "cle_confluence_winsor_lower_quantile", 0.05)),
+            winsor_upper_quantile=float(getattr(cfg, "cle_confluence_winsor_upper_quantile", 0.95)),
+            intercept=float(getattr(cfg, "cle_confluence_intercept", 0.0)),
+            temperature=float(getattr(cfg, "cle_confluence_temperature", 1.0)),
+        )
+        mapping_cfg = ConfluenceMappingConfig(
+            mode=str(getattr(cfg, "cle_mapping_mode", "linear")),
+            min_multiplier=float(getattr(cfg, "cle_mapping_min_multiplier", 0.5)),
+            max_multiplier=float(getattr(cfg, "cle_mapping_max_multiplier", 1.5)),
+            step_thresholds=tuple(float(x) for x in getattr(cfg, "cle_mapping_step_thresholds", (0.30, 0.70))),
+            step_multipliers=tuple(float(x) for x in getattr(cfg, "cle_mapping_step_multipliers", (0.50, 1.00, 1.50))),
+            kelly_gamma=float(getattr(cfg, "cle_mapping_kelly_gamma", 2.0)),
+        )
+        gates_cfg = HardGateConfig(
+            event_blackout_cap=float(getattr(cfg, "cle_gate_event_blackout_cap", 0.5)),
+            liquidity_spread_z_threshold=float(getattr(cfg, "cle_gate_liquidity_spread_z_threshold", 2.0)),
+            liquidity_depth_threshold=float(getattr(cfg, "cle_gate_liquidity_depth_threshold", 0.10)),
+            liquidity_reduction_factor=float(getattr(cfg, "cle_gate_liquidity_reduction_factor", 0.25)),
+            correlation_alert_cap=float(getattr(cfg, "cle_gate_correlation_alert_cap", 1.0)),
+        )
+        engine_cfg = LeverageEngineConfig(
+            mapping=mapping_cfg,
+            gates=gates_cfg,
+            leverage_floor=float(getattr(cfg, "cle_leverage_floor", 0.0)),
+            leverage_cap=float(getattr(cfg, "cle_leverage_cap", 12.0)),
+        )
+
+        global_signals = {
+            "alpha_conviction": alpha_conviction,
+            "ml_scalar_bias": ml_scalar_bias,
+            "decision_rate": decision_rate,
+            "vol_target_headroom": vol_target_headroom,
+            "drawdown_headroom": drawdown_headroom,
+            "ensemble_diversification": diversification,
+            "regime_score": regime_score,
+        }
+        global_signal_weights = {
+            "alpha_conviction": 1.2,
+            "ml_scalar_bias": 1.0,
+            "decision_rate": 0.8,
+            "vol_target_headroom": 0.9,
+            "drawdown_headroom": 1.2,
+            "ensemble_diversification": 0.7,
+            "regime_score": 0.6,
+        }
+        per_asset_signal_weights = {
+            "alpha": 1.4,
+            "ml_scalar_bias": 1.0,
+            "decision": 0.8,
+            "weight_magnitude": 0.6,
+        }
+        global_signal_weights, per_asset_signal_weights, online_calibration_diag = _calibrate_cle_coefficients_online(
+            cfg=cfg,
+            alpha_vec=alpha_vec,
+            ml_scalar=ml_scalar,
+            decisions=decisions,
+            base_weights=base,
+            vol_target_headroom=vol_target_headroom,
+            drawdown_headroom=drawdown_headroom,
+            diversification=diversification,
+            regime_score=regime_score,
+            base_global_weights=global_signal_weights,
+            base_per_asset_weights=per_asset_signal_weights,
+        )
+        confluence_score, confluence_diag = compute_confluence_score(
+            global_signals,
+            weights=global_signal_weights,
+            cfg=confluence_cfg,
+            return_diagnostics=True,
+        )
+        base_leverage = max(0.0, float(getattr(cfg, "cle_base_leverage", 1.0)))
+        leverage_scalar, engine_diag = compute_leverage(
+            base_leverage=base_leverage,
+            confluence_score=confluence_score,
+            cfg=engine_cfg,
+            event_blackout=event_blackout,
+            spread_z=spread_z,
+            depth_percentile=depth_percentile,
+            correlation_alert=correlation_alert,
+            return_diagnostics=True,
+        )
+
+        per_asset_scores: list[float] = []
+        per_asset_raw_leverage: list[float] = []
+        for i in range(n_assets):
+            score_i = compute_confluence_score(
+                {
+                    "alpha": float(alpha_vec[i]),
+                    "ml_scalar_bias": float(ml_scalar[i] - 1.0),
+                    "decision": float(decisions[i]),
+                    "weight_magnitude": float(abs(base[i])),
+                },
+                weights=per_asset_signal_weights,
+                cfg=confluence_cfg,
+            )
+            lev_i = compute_leverage(
+                base_leverage=1.0,
+                confluence_score=score_i,
+                cfg=engine_cfg,
+                event_blackout=event_blackout,
+                spread_z=spread_z,
+                depth_percentile=depth_percentile,
+                correlation_alert=correlation_alert,
+            )
+            per_asset_scores.append(float(score_i))
+            per_asset_raw_leverage.append(float(lev_i))
+
+        raw_arr = np.asarray(per_asset_raw_leverage, dtype=float)
+        raw_mean = float(np.mean(raw_arr)) if raw_arr.size else 1.0
+        if raw_mean <= 1e-12:
+            relative = np.ones((n_assets,), dtype=float)
+        else:
+            relative = raw_arr / raw_mean
+        leveraged = base * float(leverage_scalar) * relative
+
+        diagnostics.update(
+            {
+                "applied": bool(np.max(np.abs(leveraged - base)) > 1e-12),
+                "base_leverage": float(base_leverage),
+                "confluence_score": float(confluence_score),
+                "confluence_diagnostics": confluence_diag,
+                "leverage_scalar": float(leverage_scalar),
+                "per_asset_leverage": [float(x) for x in (float(leverage_scalar) * relative)],
+                "per_asset_confluence_scores": [float(x) for x in per_asset_scores],
+                "per_asset_relative_multiplier": [float(x) for x in relative],
+                "base_gross_exposure": float(np.sum(np.abs(base))),
+                "leveraged_gross_exposure": float(np.sum(np.abs(leveraged))),
+                "vol_target_context": {
+                    "applied": vol_target_applied,
+                    "leverage": float(vol_target_leverage),
+                },
+                "gate_context": {
+                    "event_blackout": bool(event_blackout),
+                    "spread_z": float(spread_z) if spread_z is not None else None,
+                    "depth_percentile": float(depth_percentile) if depth_percentile is not None else None,
+                    "correlation_alert": bool(correlation_alert),
+                },
+                "ensemble_context": {
+                    "max_stream_weight": float(max_stream_weight),
+                    "regime_score": float(regime_score),
+                },
+                "engine_diagnostics": engine_diag,
+                "global_signal_weights": {k: float(v) for k, v in global_signal_weights.items()},
+                "per_asset_signal_weights": {k: float(v) for k, v in per_asset_signal_weights.items()},
+                "online_calibration": online_calibration_diag,
+            }
+        )
+        return [float(x) for x in leveraged], diagnostics
+    except Exception as exc:
+        diagnostics["error"] = str(exc)
+        diagnostics["reason"] = "fallback_to_base_weights"
+        return base.tolist(), diagnostics
+
+
 def _write_returns_csv(out_dir: str, *, index: pd.Index, values: Sequence[float], value_col: str, filename: str) -> str:
     df = pd.DataFrame({"datetime": index.astype(str), value_col: np.asarray(values, dtype=float)})
     path = os.path.join(out_dir, filename)
@@ -1317,6 +2030,16 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         except Exception:
             pass
 
+    # Stage 5c: Confluence leverage engine (after ML/ensemble and before backtest schedule usage)
+    leveraged_final_weights, leverage_info = _leverage_stage(
+        cfg=cfg,
+        base_weights=final_weights,
+        expected_alphas=ensemble_alphas,
+        ml_info=ml_info,
+        ensemble_info=ensemble_info,
+        dd_guard_last_scalar=dd_guard_last_scalar,
+    )
+
     # Stage 6: Backtest performance
     if dd_guard_enabled and data_context is not None and dd_guard_last_scalar < 0.999999:
         try:
@@ -1346,7 +2069,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
             halflife = max(1, int(cfg.dd_guard_recovery_halflife))
             t = np.arange(1, n_periods + 1, dtype=float)
             scalar_test = 1.0 - (1.0 - float(dd_guard_last_scalar)) * (0.5 ** (t / float(halflife)))
-            weights_schedule = _constant_weight_schedule(final_weights, n_periods)
+            weights_schedule = _constant_weight_schedule(leveraged_final_weights, n_periods)
             adjusted_schedule = dd_guard.apply_scalar_to_weights(weights_schedule, scalar_test)
 
             dd_guard_info.update(
@@ -1390,9 +2113,9 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
             }
         except Exception:
             # if anything goes wrong, fall back to the regular backtest path
-            performance = _backtest_stage(cfg, final_weights, ml_effective_alphas, data_context=data_context)
+            performance = _backtest_stage(cfg, leveraged_final_weights, ml_effective_alphas, data_context=data_context)
     else:
-        performance = _backtest_stage(cfg, final_weights, ml_effective_alphas, data_context=data_context)
+        performance = _backtest_stage(cfg, leveraged_final_weights, ml_effective_alphas, data_context=data_context)
 
     # write dd guard artifact if enabled
     try:
@@ -1425,7 +2148,7 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
 
     if ctx is not None:
         try:
-            idx, periodic, meta = _compute_backtest_periodic_returns(cfg=cfg, final_weights=final_weights, ctx=ctx)
+            idx, periodic, meta = _compute_backtest_periodic_returns(cfg=cfg, final_weights=leveraged_final_weights, ctx=ctx)
             baseline_path = _write_returns_csv(
                 out_dir,
                 index=idx,
@@ -1442,6 +2165,29 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                 train_strategy_returns = ctx.get("train_strategy_returns")
                 test_strategy_returns = ctx.get("test_strategy_returns")
                 template_bl_weights = ctx.get("template_bl_weights")
+                template_bl_weight_source = "context_template_bl_weights"
+
+                if (
+                    isinstance(train_strategy_returns, pd.DataFrame)
+                    and not train_strategy_returns.empty
+                    and (
+                        not isinstance(template_bl_weights, pd.Series)
+                        or template_bl_weights.empty
+                    )
+                ):
+                    overlay_assets = list(train_strategy_returns.columns)
+                    fallback_weight_inputs = [
+                        ("computed_candidate_weights", candidate),
+                        ("computed_final_weights", final_weights),
+                        ("computed_leveraged_final_weights", leveraged_final_weights),
+                    ]
+                    for source_name, raw_weights in fallback_weight_inputs:
+                        normalized = _normalized_template_overlay_weights(raw_weights, overlay_assets)
+                        if normalized is not None:
+                            template_bl_weights = normalized
+                            ctx["template_bl_weights"] = normalized
+                            template_bl_weight_source = source_name
+                            break
 
                 if (
                     isinstance(train_strategy_returns, pd.DataFrame)
@@ -1454,12 +2200,13 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                     overlay = compute_template_ml_overlay(
                         train_returns_df=train_strategy_returns,
                         test_returns_df=test_strategy_returns,
-                        weights=template_bl_weights,
+                        weights=template_bl_weights.reindex(train_strategy_returns.columns).fillna(0.0),
                         cfg=cfg,
                         include_series=True,
                     )
                     series = overlay.pop("series", None)
-                    template_ml_overlay = {"enabled": True, **overlay}
+                    template_ml_overlay = {"enabled": True, "weights_source": template_bl_weight_source, **overlay}
+                    returns_csv_info["ml_weights_source"] = template_bl_weight_source
 
                     if not isinstance(series, dict):
                         returns_csv_info["ml_error"] = "missing_series_payload"
@@ -1556,11 +2303,18 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                         if bool(getattr(cfg, "ml_meta_overlay_enabled", False)):
                             try:
                                 # For strict parity, prefer benchmark CSV if present (Template/ or vendored fixture).
-                                bench_test_df, bench_test_src = _try_load_template_benchmark_csv(
-                                    os.getcwd(),
-                                    filename="portfolio_test_returns_ml_meta.csv",
-                                    required_cols=("datetime", "portfolio_return_ml_meta"),
+                                bench_test_df = None
+                                bench_test_src = None
+                                allow_ml_meta_benchmark_csv = bool(
+                                    getattr(cfg, "template_use_precomputed_artifacts", True)
+                                    or getattr(cfg, "ml_meta_comparator_use_benchmark_csv", False)
                                 )
+                                if allow_ml_meta_benchmark_csv:
+                                    bench_test_df, bench_test_src = _try_load_template_benchmark_csv(
+                                        os.getcwd(),
+                                        filename="portfolio_test_returns_ml_meta.csv",
+                                        required_cols=("datetime", "portfolio_return_ml_meta"),
+                                    )
 
                                 if bench_test_df is not None:
                                     bench_meta_test_path = _write_returns_csv(
@@ -1595,11 +2349,14 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                     }
 
                                     # Optional extras (only available when Template/ exists)
-                                    bench_train_df, bench_train_src = _try_load_template_benchmark_csv(
-                                        os.getcwd(),
-                                        filename="portfolio_train_returns_ml_meta.csv",
-                                        required_cols=("datetime", "portfolio_return_ml_meta"),
-                                    )
+                                    bench_train_df = None
+                                    bench_train_src = None
+                                    if allow_ml_meta_benchmark_csv:
+                                        bench_train_df, bench_train_src = _try_load_template_benchmark_csv(
+                                            os.getcwd(),
+                                            filename="portfolio_train_returns_ml_meta.csv",
+                                            required_cols=("datetime", "portfolio_return_ml_meta"),
+                                        )
                                     if bench_train_df is not None:
                                         bench_meta_train_path = _write_returns_csv(
                                             out_dir,
@@ -1610,11 +2367,14 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                         )
                                         returns_csv_info.update({"ml_meta_train_path": bench_meta_train_path, "ml_meta_benchmark_train_path": bench_train_src})
 
-                                    bench_expo_test_df, bench_expo_test_src = _try_load_template_benchmark_csv(
-                                        os.getcwd(),
-                                        filename="portfolio_test_exposure_ml_meta.csv",
-                                        required_cols=("datetime", "exposure"),
-                                    )
+                                    bench_expo_test_df = None
+                                    bench_expo_test_src = None
+                                    if allow_ml_meta_benchmark_csv:
+                                        bench_expo_test_df, bench_expo_test_src = _try_load_template_benchmark_csv(
+                                            os.getcwd(),
+                                            filename="portfolio_test_exposure_ml_meta.csv",
+                                            required_cols=("datetime", "exposure"),
+                                        )
                                     if bench_expo_test_df is not None:
                                         bench_expo_test_path = _write_returns_csv(
                                             out_dir,
@@ -1625,11 +2385,14 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
                                         )
                                         returns_csv_info.update({"ml_meta_exposure_path": bench_expo_test_path, "ml_meta_benchmark_exposure_path": bench_expo_test_src})
 
-                                    bench_expo_train_df, bench_expo_train_src = _try_load_template_benchmark_csv(
-                                        os.getcwd(),
-                                        filename="portfolio_train_exposure_ml_meta.csv",
-                                        required_cols=("datetime", "exposure"),
-                                    )
+                                    bench_expo_train_df = None
+                                    bench_expo_train_src = None
+                                    if allow_ml_meta_benchmark_csv:
+                                        bench_expo_train_df, bench_expo_train_src = _try_load_template_benchmark_csv(
+                                            os.getcwd(),
+                                            filename="portfolio_train_exposure_ml_meta.csv",
+                                            required_cols=("datetime", "exposure"),
+                                        )
                                     if bench_expo_train_df is not None:
                                         bench_expo_train_path = _write_returns_csv(
                                             out_dir,
@@ -1741,7 +2504,24 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
     except Exception as exc:
         returns_csv_info["performance_overlay_promotion_error"] = str(exc)
 
+    benchmark_injection_sources = _collect_benchmark_injection_sources(
+        returns_csv_info=returns_csv_info,
+        template_ml_meta_overlay=template_ml_meta_overlay,
+    )
+    _annotate_independence_metadata(
+        performance=performance,
+        returns_csv_info=returns_csv_info,
+        cfg=cfg,
+        benchmark_injection_sources=benchmark_injection_sources,
+    )
+    if bool(getattr(cfg, "strict_independent_mode", False)) and benchmark_injection_sources:
+        raise ValueError(
+            "strict_independent_mode violation: benchmark/comparator CSV source detected in run outputs: "
+            + ", ".join(benchmark_injection_sources)
+        )
+
     # Stage 7: Reporting artifacts
+    cle_report = build_cle_report(leverage_info)
     artifacts = {
         "current_weights": current,
         "candidate_weights": candidate,
@@ -1751,6 +2531,9 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         "effective_expected_alphas": ensemble_alphas,
         "gated_weights": gated,
         "final_weights": final_weights,
+        "leveraged_final_weights": leveraged_final_weights,
+        "leverage_info": leverage_info,
+        "cle_report": cle_report,
         "ml_info": ml_info,
         "performance": performance,
         "returns_csv_info": returns_csv_info,
@@ -1758,6 +2541,9 @@ def run_pipeline(run_id: Optional[str] = None, cfg: Optional[BacktestConfig] = N
         "template_ml_meta_overlay": template_ml_meta_overlay,
         "regime_report_info": regime_report_info,
     }
+    cle_online_calibration = leverage_info.get("online_calibration") if isinstance(leverage_info, dict) else None
+    if isinstance(cle_online_calibration, dict) and bool(cle_online_calibration.get("enabled", False)):
+        artifacts["cle_online_calibration"] = cle_online_calibration
     if data_quality_report is not None:
         artifacts["data_quality"] = data_quality_report
     if cfg.stress_enabled:

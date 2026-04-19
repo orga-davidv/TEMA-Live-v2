@@ -110,6 +110,35 @@ def test_select_best_triple_ema_combo_enforces_min_gap_and_order(monkeypatch):
     assert best_combo == (2, 5, 8)
 
 
+def test_select_best_triple_ema_combo_applies_template_shortlist_floor(monkeypatch):
+    subtrain = pd.Series(np.linspace(1.0, 2.0, 20), name="subtrain")
+    validation = pd.Series(np.linspace(1.0, 2.0, 20), name="validation")
+    combos = [(i, i + 1, i + 2) for i in range(1, 13)]
+
+    def _fake_eval(close, combo, **kwargs):
+        rank = int(combo[0])
+        if close.name == "subtrain":
+            # Higher train Sharpe for smaller ranks -> combo rank 10 is outside top-3.
+            sharpe = float(100 - rank)
+        else:
+            # Make rank-10 clearly best in validation.
+            sharpe = 5.0 if rank == 10 else 0.0
+        return {"combo": combo, "returns": pd.Series(dtype=float), "sharpe": sharpe}
+
+    monkeypatch.setattr("tema.strategy_returns.evaluate_triple_ema_combo", _fake_eval)
+
+    best_combo, info = select_best_triple_ema_combo(
+        subtrain,
+        validation,
+        combos,
+        validation_shortlist=3,
+        overfit_penalty=0.0,
+    )
+
+    assert best_combo == (10, 11, 12)
+    assert info["shortlist_size"] == 10
+
+
 def test_compute_annualized_sharpe_matches_backtest_metric_semantics_with_rf():
     returns = pd.Series([0.01, -0.005, 0.02, 0.0, 0.01], dtype=float)
     rf = 0.02
@@ -181,3 +210,143 @@ def test_build_train_test_strategy_returns_by_asset_uses_selected_combo(monkeypa
     assert np.allclose(test_ret["A"].to_numpy(), 0.02)
     assert np.allclose(test_ret["B"].to_numpy(), 0.03)
     assert set(selection["asset"]) == {"A", "B"}
+
+
+def test_build_train_test_strategy_returns_by_asset_uses_combo_anchors_when_provided(monkeypatch):
+    train_df = pd.DataFrame({"A": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0], "B": [200.0, 201.0, 202.0, 203.0, 204.0, 205.0]})
+    test_df = pd.DataFrame({"A": [106.0, 107.0, 108.0], "B": [206.0, 207.0, 208.0]})
+    combos = [(2, 4, 8), (3, 6, 9)]
+    calls = {"select": 0}
+
+    def _fake_select(*args, **kwargs):
+        calls["select"] += 1
+        return (2, 4, 8), {"subtrain_sharpe": 1.0, "val_sharpe": 0.8, "selection_score": 0.7}
+
+    def _fake_eval(close, combo, **kwargs):
+        return {"combo": combo, "returns": pd.Series(0.0, index=close.index, dtype=float), "sharpe": float(combo[0]) / 10.0}
+
+    def _fake_build(close, combo, **kwargs):
+        return pd.Series(np.full(len(close), float(combo[0]) / 100.0), index=close.index, dtype=float)
+
+    monkeypatch.setattr("tema.strategy_returns.select_best_triple_ema_combo", _fake_select)
+    monkeypatch.setattr("tema.strategy_returns.evaluate_triple_ema_combo", _fake_eval)
+    monkeypatch.setattr("tema.strategy_returns.build_strategy_returns_for_triple_ema_combo", _fake_build)
+
+    train_ret, test_ret, selection = build_train_test_strategy_returns_by_asset(
+        train_df,
+        test_df,
+        combos,
+        combo_anchors={"A": (3, 6, 9), "B": (2, 4, 8)},
+    )
+
+    assert calls["select"] == 0
+    assert np.allclose(train_ret["A"].to_numpy(), 0.03)
+    assert np.allclose(train_ret["B"].to_numpy(), 0.02)
+    assert np.allclose(test_ret["A"].to_numpy(), 0.03)
+    assert np.allclose(test_ret["B"].to_numpy(), 0.02)
+    assert set(selection["selection_source"]) == {"template_summary_anchor"}
+
+
+def test_build_train_test_strategy_returns_by_asset_falls_back_to_grid_without_anchor(monkeypatch):
+    train_df = pd.DataFrame({"A": [100.0, 101.0, 102.0, 103.0, 104.0, 105.0], "B": [200.0, 201.0, 202.0, 203.0, 204.0, 205.0]})
+    test_df = pd.DataFrame({"A": [106.0, 107.0, 108.0], "B": [206.0, 207.0, 208.0]})
+    combos = [(2, 4, 8), (3, 6, 9)]
+    calls = {"select": 0}
+
+    def _fake_select(subtrain_close, validation_close, combos, **kwargs):
+        calls["select"] += 1
+        if subtrain_close.name == "A":
+            return (2, 4, 8), {"subtrain_sharpe": 1.0, "val_sharpe": 0.8, "selection_score": 0.7}
+        return (3, 6, 9), {"subtrain_sharpe": 0.9, "val_sharpe": 1.1, "selection_score": 1.0}
+
+    def _fake_build(close, combo, **kwargs):
+        return pd.Series(np.full(len(close), float(combo[0]) / 100.0), index=close.index, dtype=float)
+
+    monkeypatch.setattr("tema.strategy_returns.select_best_triple_ema_combo", _fake_select)
+    monkeypatch.setattr("tema.strategy_returns.build_strategy_returns_for_triple_ema_combo", _fake_build)
+
+    _, _, selection = build_train_test_strategy_returns_by_asset(
+        train_df,
+        test_df,
+        combos,
+        combo_anchors={"A": (2, 4, 8)},
+    )
+
+    assert calls["select"] == 1
+    by_asset = dict(zip(selection["asset"], selection["selection_source"]))
+    assert by_asset["A"] == "template_summary_anchor"
+    assert by_asset["B"] == "train_validation_grid"
+
+
+def test_build_train_test_strategy_returns_by_asset_uses_dense_series_for_split(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=8, freq="D")
+    train_df = pd.DataFrame(
+        {
+            "A": [100.0, 101.0, np.nan, 103.0, 104.0, np.nan, 106.0, 107.0],
+            "B": [np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+        },
+        index=idx,
+    )
+    test_df = pd.DataFrame(
+        {
+            "A": [108.0, np.nan, 109.0, 110.0],
+            "B": [np.nan, np.nan, np.nan, np.nan],
+        },
+        index=pd.date_range("2024-01-09", periods=4, freq="D"),
+    )
+    seen = {}
+
+    def _fake_select(subtrain_close, validation_close, combos, **kwargs):
+        seen["subtrain_len"] = len(subtrain_close)
+        seen["validation_len"] = len(validation_close)
+        return (2, 4, 8), {"subtrain_sharpe": 1.0, "val_sharpe": 0.8, "selection_score": 0.7}
+
+    def _fake_build(close, combo, **kwargs):
+        return pd.Series(0.01, index=close.index, dtype=float)
+
+    monkeypatch.setattr("tema.strategy_returns.select_best_triple_ema_combo", _fake_select)
+    monkeypatch.setattr("tema.strategy_returns.build_strategy_returns_for_triple_ema_combo", _fake_build)
+
+    train_ret, test_ret, selection = build_train_test_strategy_returns_by_asset(
+        train_df,
+        test_df,
+        [(2, 4, 8)],
+        validation_ratio=0.25,
+        validation_min_rows=2,
+    )
+
+    assert seen["subtrain_len"] + seen["validation_len"] == 6
+    assert np.isclose(train_ret["A"].dropna().iloc[0], 0.01)
+    assert np.isclose(test_ret["A"].dropna().iloc[0], 0.01)
+    skipped = selection[selection["ema1_period"].isna()]
+    assert set(skipped["asset"]) == {"B"}
+
+
+def test_build_train_test_strategy_returns_by_asset_matches_template_validation_split_clamp(monkeypatch):
+    idx = pd.date_range("2024-01-01", periods=10, freq="D")
+    train_df = pd.DataFrame({"A": np.linspace(100.0, 110.0, 10)}, index=idx)
+    test_df = pd.DataFrame({"A": [111.0, 112.0, 113.0]}, index=pd.date_range("2024-01-11", periods=3, freq="D"))
+    seen = {}
+
+    def _fake_select(subtrain_close, validation_close, combos, **kwargs):
+        seen["subtrain_len"] = len(subtrain_close)
+        seen["validation_len"] = len(validation_close)
+        return (2, 4, 8), {"subtrain_sharpe": 1.0, "val_sharpe": 0.8, "selection_score": 0.7}
+
+    def _fake_build(close, combo, **kwargs):
+        return pd.Series(0.01, index=close.index, dtype=float)
+
+    monkeypatch.setattr("tema.strategy_returns.select_best_triple_ema_combo", _fake_select)
+    monkeypatch.setattr("tema.strategy_returns.build_strategy_returns_for_triple_ema_combo", _fake_build)
+
+    _, _, selection = build_train_test_strategy_returns_by_asset(
+        train_df,
+        test_df,
+        [(2, 4, 8)],
+        validation_ratio=0.25,
+        validation_min_rows=6,
+    )
+
+    assert seen["subtrain_len"] == 6
+    assert seen["validation_len"] == 4
+    assert int(selection.loc[selection["asset"] == "A", "split_idx"].iloc[0]) == 6
